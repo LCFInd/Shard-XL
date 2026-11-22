@@ -10,7 +10,7 @@ static void demo_scenes(void)
     int t;
     scene_store(0);
     /* 2: the machine loop in, the bass driven harder, a little filter on the drums */
-    XL.trk[4].p[P_MUTE] = 0; XL.trk[1].p[P_DR1] = 0.6f; XL.trk[1].p[P_FB1] = 0.3f; XL.trk[0].p[P_DJ] = 0.15f;
+    XL.trk[4].p[P_MUTE] = 0; XL.trk[1].p[P_TY1] = SH_DIST; XL.trk[1].p[P_DR1] = 0.6f; XL.trk[1].p[P_FB1] = 0.3f; XL.trk[0].p[P_DJ] = 0.15f;
     XL.trk[5].p[P_MUTE] = 0;
     scene_store(1);
     /* 3: a breakdown: the drone and the metal, the rest out */

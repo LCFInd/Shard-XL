@@ -17,7 +17,8 @@
 #define XL_CAPTURE_SEC 60
 
 enum { ENG_SAMPLE, ENG_SHARD, ENG_N };
-enum { SH_TUBE, SH_FOLD, SH_CLIP, SH_BIT, SH_N };
+/* a band's shaper: SHARD's DRIVE types, in SHARD's order (the project file stores the index) */
+enum { SH_OFF, SH_OVRDRV, SH_DIST, SH_FOLD, SH_CRUSH, SH_DECIM, SH_HALF, SH_TUBE, SH_FUZZ, SH_N };
 enum { DIV_4, DIV_8, DIV_16, DIV_32, DIV_8T, DIV_16T, DIV_N };
 
 /* A track's parameters: floats, so a scene can morph between two of them. */

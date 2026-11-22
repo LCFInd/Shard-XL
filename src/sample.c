@@ -384,7 +384,7 @@ void xl_demo_kit(void)
         k->p[P_MUTE] = 1;
         XL.trk[3].st[0].on = 1; XL.trk[3].st[0].note = 60; XL.trk[3].p[P_SLEN] = 32; XL.trk[3].p[P_LEVEL] = -12;
         XL.trk[3].p[P_REL] = 800;
-        XL.trk[1].p[P_DR1] = 0.25f; XL.trk[1].p[P_LV2] = -6;
+        XL.trk[1].p[P_TY1] = SH_OVRDRV; XL.trk[1].p[P_DR1] = 0.25f; XL.trk[1].p[P_LV2] = -6;
         XL.trk[5].p[P_MUTE] = 1; XL.trk[5].st[0].on = 1; XL.trk[5].st[6].on = 1; XL.trk[5].st[0].note = 60; XL.trk[5].st[6].note = 63;
         XL.trk[5].p[P_SENDFX] = 0.4f;
         for (t = 0; t < 6; t++) XL.trk[t].p[P_SENDB] = t % 2 ? 0.5f : 0.2f;

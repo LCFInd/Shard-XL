@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
 /* The project file: plain text, one value per line, so it can be read and mended by hand.
- *   shardxl 1
+ *   shardxl 2                          (1: before SHARD's DRIVE types; converted on load)
  *   g <index> <value>                  globals (xl.h G_*)
  *   t <track> p <index> <value>        track parameters (xl.h P_*)
  *   t <track> sample <path>            its sample (by path: the file itself stays where it is)
@@ -23,7 +23,7 @@ int xl_project_save(const char *path)
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     f = fopen(tmp, "w");
     if (!f) return -1;
-    fprintf(f, "shardxl 1\n");
+    fprintf(f, "shardxl 2\n");
     for (i = 0; i < NG; i++) fprintf(f, "g %d %.9g\n", i, XL.g[i]);
     for (t = 0; t < XL_NTRK; t++) {
         xl_track *tk = &XL.trk[t];
@@ -65,14 +65,24 @@ static void step_set(xl_step *s, int on, int note, int vel, int pr, int ra, int 
     s->prob = (uint8_t)(pr < 0 ? 0 : pr > 100 ? 100 : pr); s->ratchet = (uint8_t)(ra < 1 ? 1 : ra > 4 ? 4 : ra);
     s->cond = (uint8_t)(co < 1 ? 1 : co > 8 ? 8 : co);
 }
+/* version 1 had 4 shaper types (TUBE FOLD CLIP BIT) and DRIVE 0 meant clean: to SHARD's (2026-11-22) */
+static void v1_types(float *p)
+{
+    static const int MAP[4] = {SH_TUBE, SH_FOLD, SH_DIST, SH_CRUSH};
+    int b;
+    for (b = 0; b < 4; b++) {
+        int old = (int)p[P_TY0 + b];
+        p[P_TY0 + b] = p[P_DR0 + b] > 0.001f && old >= 0 && old < 4 ? (float)MAP[old] : (float)SH_OFF;
+    }
+}
 int xl_project_load(const char *path)
 {
     FILE *f = fopen(path, "r");
     char line[2048];
-    int t, i, k, a[8];
+    int t, i, k, a[8], ver = 0;
     float v, w;
     if (!f) return -1;
-    if (!fgets(line, sizeof line, f) || strncmp(line, "shardxl ", 8)) { fclose(f); return -1; }
+    if (!fgets(line, sizeof line, f) || sscanf(line, "shardxl %d", &ver) != 1) { fclose(f); return -1; }
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
         if (sscanf(line, "g %d %f", &i, &v) == 2) { if (i >= 0 && i < NG) XL.g[i] = xl_pval(&XL_G[i], v); }
@@ -107,5 +117,9 @@ int xl_project_load(const char *path)
         }
     }
     fclose(f);
+    if (ver < 2) {
+        for (t = 0; t < XL_NTRK; t++) v1_types(XL.trk[t].p);
+        for (k = 0; k < XL_NSCENE; k++) if (XL.scene[k].valid) for (t = 0; t < XL_NTRK; t++) v1_types(XL.scene[k].p[t]);
+    }
     return 0;
 }

@@ -845,9 +845,9 @@ static void page_deck(void)
             d_rect(rx, cy, w, 56, s ? C_RT : C_P, 8);
             d_frame(rx, cy, w, 56, s ? C_R : C_L, 1, 8);
             d_rect(rx + 10, cy + 8, 40, 40, C_BG, 4);
-            for (k = 0; k < 20; k++) {   /* the transfer curve */
-                float x0 = -1 + k / 10.0f, x1 = -1 + (k + 1) / 10.0f, g = 1 + t->p[P_DR0 + i] * 30;
-                float y0 = t->p[P_DR0 + i] > 0.001f ? shape(ty, x0, g) : x0, y1 = t->p[P_DR0 + i] > 0.001f ? shape(ty, x1, g) : x1;
+            for (k = 0; k < 40; k++) {   /* the transfer curve */
+                float x0 = -1 + k / 20.0f, x1 = -1 + (k + 1) / 20.0f, d = t->p[P_DR0 + i];
+                float y0 = satf(shape_curve(ty, d, x0), 1.1f), y1 = satf(shape_curve(ty, d, x1), 1.1f);
                 d_line(rx + 30 + x0 * 18, cy + 28 - y0 * 16, rx + 30 + x1 * 18, cy + 28 - y1 * 16, s ? C_R : C_D, 1.5f);
             }
             d_text(rx + 62, cy + 24, F15, C_T, names[i], 0);

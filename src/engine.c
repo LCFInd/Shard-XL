@@ -16,7 +16,7 @@ xl_state XL;
 xl_queue XL_CMD, XL_MIDI, XL_EV;
 
 static const char *const ENG_L[] = {"SAMPLE", "SHARD"};
-static const char *const SH_L[] = {"TUBE", "FOLD", "CLIP", "BIT"};
+static const char *const SH_L[] = {"OFF", "OVRDRV", "DIST", "FOLD", "CRUSH", "DECIM", "HALF", "TUBE", "FUZZ"};
 static const char *const SLOPE_L[] = {"12 dB", "24 dB"};
 static const char *const DIV_L[] = {"1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T"};
 static const char *const OFFON_L[] = {"OFF", "ON"};
@@ -45,8 +45,8 @@ const xl_pdesc XL_P[NP] = {
     [P_X3] = {"XHI", 30, 16000, 6000, PF_LOG, 0, "Hz"},
     [P_LV0] = {"LEVEL", -60, 12, 0, 0, 0, "dB"}, [P_LV1] = {"LEVEL", -60, 12, 0, 0, 0, "dB"},
     [P_LV2] = {"LEVEL", -60, 12, 0, 0, 0, "dB"}, [P_LV3] = {"LEVEL", -60, 12, 0, 0, 0, "dB"},
-    [P_TY0] = {"TYPE", 0, 3, 0, PF_ENUM, SH_L, ""}, [P_TY1] = {"TYPE", 0, 3, 0, PF_ENUM, SH_L, ""},
-    [P_TY2] = {"TYPE", 0, 3, 0, PF_ENUM, SH_L, ""}, [P_TY3] = {"TYPE", 0, 3, 0, PF_ENUM, SH_L, ""},
+    [P_TY0] = {"TYPE", 0, SH_N - 1, 0, PF_ENUM, SH_L, ""}, [P_TY1] = {"TYPE", 0, SH_N - 1, 0, PF_ENUM, SH_L, ""},
+    [P_TY2] = {"TYPE", 0, SH_N - 1, 0, PF_ENUM, SH_L, ""}, [P_TY3] = {"TYPE", 0, SH_N - 1, 0, PF_ENUM, SH_L, ""},
     [P_DR0] = {"DRIVE", 0, 1, 0, 0, 0, "%"}, [P_DR1] = {"DRIVE", 0, 1, 0, 0, 0, "%"},
     [P_DR2] = {"DRIVE", 0, 1, 0, 0, 0, "%"}, [P_DR3] = {"DRIVE", 0, 1, 0, 0, 0, "%"},
     [P_FB0] = {"FEEDBACK", 0, 0.95f, 0, 0, 0, "%"}, [P_FB1] = {"FEEDBACK", 0, 0.95f, 0, 0, 0, "%"},
@@ -89,7 +89,6 @@ void xl_track_defaults(xl_track *t)
 {
     int i;
     for (i = 0; i < NP; i++) t->p[i] = XL_P[i].def;
-    t->p[P_TY1] = SH_CLIP; t->p[P_TY2] = SH_FOLD; t->p[P_TY3] = SH_BIT;
     memset(t->st, 0, sizeof t->st);
     for (i = 0; i < XL_NSTEP; i++) { t->st[i].note = 60; t->st[i].vel = 100; t->st[i].prob = 100;
                                      t->st[i].ratchet = 1; t->st[i].cond = 1; }
@@ -148,17 +147,205 @@ static void bq_set(bq *f, int kind, float hz)   /* kind: 0 LP2 (Q .7071), 1 HP2,
     }
 }
 static inline float db2lin(float db) { return db <= -59.5f ? 0.0f : powf(10.0f, db / 20.0f); }
-static inline float shape(int ty, float x, float g)
+/* ---- the band shapers: SHARD's DRIVE types (SHARD eng_shard.c shd_shape), the same circuits in float. 1.0 is full
+ * scale. OVRDRV, DIST, FOLD, HALF, TUBE and FUZZ run at 4x (a 97-tap windowed-sinc FIR up and down: 24 samples of
+ * latency at 48 kHz); CRUSH and DECIM at 1x, as on SHARD (their aliasing is the sound). Every band is delayed to
+ * the same 24 samples, so the bands stay in line whatever each one's TYPE. */
+#define OS 4
+#define OS_N 97
+#define OS_LAT 24
+static float OS_H[OS_N];                  /* the FIR, at 4 x 48 kHz */
+static float A_[11], ENV_UP, ENV_DN;      /* one-poles at 4x: 20 60 80 120 200 400 1100 1539 4500 5500 9000 Hz */
+enum { A20, A60, A80, A120, A200, A400, A1100, A1539, A4500, A5500, A9000 };
+int xl_os_off;                            /* (tests: run the shapers at 1x, to hear what 4x saves) */
+static float onepole(float hz, float fs) { return 1.0f - expf(-2.0f * (float)M_PI * hz / fs); }
+static void shaper_init(void)
 {
-    switch (ty) {
-    case SH_TUBE: return tanhf(g * x + 0.2f) - 0.19738f;
-    case SH_FOLD: return sinf(g * x * 1.5707963f);
-    case SH_CLIP: { float y = g * x; return y > 1 ? 1 : y < -1 ? -1 : y; }
-    default: {  /* BIT: fewer bits as DRIVE rises */
-        float lv = powf(2.0f, 12.0f - 10.0f * (g - 1) / 30.0f);
-        float y = floorf(x * lv + 0.5f) / lv;
-        return y > 1 ? 1 : y < -1 ? -1 : y;
+    static const float HZ[11] = {20, 60, 80, 120, 200, 400, 1100, 1539, 4500, 5500, 9000};
+    const float fs = XL_SR * OS, fc = 24000.0f / fs, beta = 7.0f;   /* cut at 24 kHz: passes 20k, stops 28k images */
+    double i0b = 1, t = 1;
+    int i, k;
+    for (k = 1; k < 30; k++) { t *= (beta / 2 / k) * (beta / 2 / k); i0b += t; }
+    for (i = 0; i < OS_N; i++) {
+        double m = i - (OS_N - 1) / 2.0, x = 2 * fc * m, sn = fabs(x) < 1e-9 ? 1 : sin(M_PI * x) / (M_PI * x);
+        double q = m / ((OS_N - 1) / 2.0), w = 1, tt = 1, arg = beta * sqrt(1 - q * q);
+        for (k = 1; k < 30; k++) { tt *= (arg / 2 / k) * (arg / 2 / k); w += tt; }
+        OS_H[i] = (float)(2 * fc * sn * w / i0b);
     }
+    for (i = 0; i < 11; i++) A_[i] = onepole(HZ[i], fs);
+    ENV_UP = 1.0f - expf(-1.0f / (0.000714f * fs));   /* OVRDRV's grid: ~0.7 ms to charge, ~46 ms to let go */
+    ENV_DN = 1.0f - expf(-1.0f / (0.0464f * fs));
+}
+static inline float satf(float x, float l) { return x > l ? l : x < -l ? -l : x; }
+static inline float softf(float x)          /* tanh, rational (SHARD's shd_soft) */
+{
+    if (x >= 3) return 1;
+    if (x <= -3) return -1;
+    return x * (27 + x * x) / (27 + 9 * x * x);
+}
+static inline float diodef(float x)         /* two silicon diodes: linear to 0.5, a knee to 1 at 1.5 */
+{
+    float a = fabsf(x), y, d;
+    if (a <= 0.5f) return x;
+    if (a >= 1.5f) y = 1;
+    else { d = a - 0.5f; y = 0.5f + d - d * d * 0.5f; }
+    return x < 0 ? -y : y;
+}
+static inline float cubicf(float x)         /* a transistor stage: 1.5 x - 0.5 x^3, flat past 1 */
+{
+    if (x >= 1) return 1;
+    if (x <= -1) return -1;
+    return (3 * x - x * x * x) * 0.5f;
+}
+static inline float triodef(float p)        /* the grid rounds the top early, cutoff clips the bottom later */
+{
+    return p >= 0 ? softf(p) : -diodef(-p * 0.75f) * 1.5f;
+}
+#define LPF(st, in, a) ((st) += ((in) - (st)) * (a))
+typedef struct {                            /* one band's shaper, one channel */
+    float f[6], env, prev, held;
+    int cnt;
+    float up[64], dn[2 * OS_N];             /* the 4x FIR's histories (each written twice: read without wrapping) */
+    int upw, dnw;
+    float dl[OS_LAT];                       /* the delay that keeps a 1x band in line */
+    int dlw;
+} shp_t;
+typedef struct {                            /* what DRIVE sets, worked out once a block */
+    float d, g, makeup, tube_g, tube_lp, rat_hi, rat_lo, rat_lp, war_g, war_th;
+    int crush_sh, decim_n;
+} shk_t;
+static void shk_set(shk_t *k, float d)
+{
+    float R = 100000.0f * powf(d, 2.4f), fs = XL_SR * OS;
+    k->d = d;
+    k->g = powf(64.0f, d);
+    k->makeup = powf(k->g, -0.4f);
+    k->tube_g = powf(48.0f, d);
+    k->tube_lp = onepole(9000.0f * powf(0.5f, d), fs);
+    k->rat_hi = R / 47; k->rat_lo = R / 560;
+    { float f = 1.6e6f / (1 + R / 47); k->rat_lp = onepole(f < 2500 ? 2500 : f > 20000 ? 20000 : f, fs); }
+    k->war_g = powf(14.0f, d);
+    k->war_th = 1800.0f * d * d / 32768.0f;
+    k->crush_sh = 1 + (int)(d * 12);
+    k->decim_n = 1 + (int)(d * 31);
+}
+/* OVRDRV: a 12AX7 stage: the coupling capacitor in, x1 .. x48, the grid biasing it colder after a hit, the triode's
+ * curve, the plate's DC out, the Miller roll-off (9 kHz .. 4.5 kHz) */
+static float sh_tube(shp_t *s, const shk_t *k, float x)
+{
+    float u, m, y;
+    LPF(s->f[0], x, A_[A80]);
+    u = satf((x - s->f[0]) * k->tube_g, 256);
+    if (u > s->env) s->env += (u - s->env) * ENV_UP;
+    else s->env -= s->env * ENV_DN;
+    u -= s->env * 0.25f;
+    m = (s->prev + u) * 0.5f; s->prev = u;
+    y = (triodef(m) + triodef(u)) * 0.5f;
+    LPF(s->f[1], y, A_[A20]);
+    y -= s->f[1];
+    LPF(s->f[2], y, k->tube_lp);
+    return s->f[2] * (17000.0f / 32768);
+}
+/* DIST: a ProCo RAT: the highs (above 1.5 kHz) gain up to x2100, the lows (above 60 Hz) x180; the op-amp closes the
+ * top as the gain rises; the rails round it; two diodes clip it hard; the FILTER after, ~4.5 kHz */
+static float sh_rat(shp_t *s, const shk_t *k, float x)
+{
+    float g, u, m, y;
+    LPF(s->f[0], x, A_[A60]);
+    LPF(s->f[1], x, A_[A1539]);
+    g = x + (x - s->f[1]) * k->rat_hi + (x - s->f[0]) * k->rat_lo;
+    u = satf(g, 256);
+    LPF(s->f[2], u, k->rat_lp);
+    u = softf(s->f[2] * 2 / 15) * 7.5f;
+    m = (s->prev + u) * 0.5f; s->prev = u;
+    y = (diodef(m) + diodef(u)) * 0.5f;
+    LPF(s->f[3], y, A_[A4500]);
+    return s->f[3] * (18000.0f / 32768);
+}
+/* FUZZ: after Death By Audio's Fuzz War: three stages of x1 .. x14, a starved first stage's sputter, the Muff's
+ * scooped tone stack, the diodes */
+static float sh_war(shp_t *s, const shk_t *k, float x)
+{
+    float a, m, y, g = k->war_g, th = k->war_th;
+    LPF(s->f[0], x, A_[A120]);
+    a = x - s->f[0];
+    a = a > th ? a - th : a < -th ? a + th : 0;
+    a = cubicf(satf(a * g, 96));
+    LPF(s->f[1], a, A_[A200]);
+    a -= s->f[1];
+    LPF(s->f[2], a, A_[A5500]);
+    a = cubicf(s->f[2] * g);
+    a = cubicf(a * g);
+    LPF(s->f[3], a, A_[A400]);
+    LPF(s->f[4], a, A_[A1100]);
+    a = (s->f[3] + a - s->f[4]) * 1.5f;
+    m = (s->prev + a) * 0.5f; s->prev = a;
+    y = (diodef(m) + diodef(a)) * 0.5f;
+    LPF(s->f[5], y, A_[A20]);
+    return (y - s->f[5]) * (19000.0f / 32768);
+}
+/* one sample through a shaper (at whatever rate it is called) */
+static float shape1(int ty, shp_t *s, const shk_t *k, float x)
+{
+    float p, y;
+    x = satf(x, 4);
+    switch (ty) {
+    case SH_OVRDRV: return sh_tube(s, k, x);
+    case SH_DIST: return sh_rat(s, k, x);
+    case SH_FUZZ: return sh_war(s, k, x);
+    case SH_CRUSH: { float st = ldexpf(1.0f, k->crush_sh) / 32768; return floorf(satf(x, 1) / st) * st; }
+    case SH_DECIM: if (++s->cnt >= k->decim_n) { s->cnt = 0; s->held = x; } return s->held;
+    default: break;
+    }
+    p = x * k->g;
+    switch (ty) {
+    case SH_FOLD: { float f = fmodf(satf(p, 96) + 1, 4); if (f < 0) f += 4; y = f < 2 ? f - 1 : 3 - f; break; }
+    case SH_HALF: y = p > 0 ? softf(p) : softf(p) * 0.25f; break;
+    case SH_TUBE: y = p >= 0 ? softf(p) : softf(p * 1.5f) * 0.75f; break;
+    default: return x;
+    }
+    return y * k->makeup;
+}
+/* a band through its shaper: 4x for the analog types, else 1x and delayed to match; OFF only delays */
+static float shape_band(int ty, shp_t *s, const shk_t *k, float x)
+{
+    if (ty == SH_OFF || ty == SH_CRUSH || ty == SH_DECIM || xl_os_off) {
+        float y = ty == SH_OFF ? x : shape1(ty, s, k, x), o = s->dl[s->dlw];
+        s->dl[s->dlw] = y;
+        s->dlw = (s->dlw + 1) % OS_LAT;
+        return o;
+    }
+    {
+        float acc = 0;
+        const float *u0, *d0;
+        int ph, j;
+        s->upw = (s->upw + 1) & 31;
+        s->up[s->upw] = s->up[s->upw + 32] = x;
+        u0 = &s->up[s->upw + 32];               /* u0[-j]: the input j samples ago */
+        for (ph = 0; ph < OS; ph++) {
+            float u = 0, v;
+            for (j = 0; ph + OS * j < OS_N; j++) u += OS_H[ph + OS * j] * u0[-j];
+            v = shape1(ty, s, k, u * OS);
+            s->dnw = s->dnw + 1 >= OS_N ? 0 : s->dnw + 1;
+            s->dn[s->dnw] = s->dn[s->dnw + OS_N] = v;
+        }
+        d0 = &s->dn[s->dnw + OS_N];             /* d0[-j]: the 4x signal j samples ago */
+        for (j = 0; j < OS_N; j++) acc += OS_H[j] * d0[-j];
+        return acc;
+    }
+}
+/* the transfer curve the DECK page draws (a still picture of each type at its DRIVE) */
+static float shape_curve(int ty, float d, float x)
+{
+    shk_t k;
+    shk_set(&k, d);
+    switch (ty) {
+    case SH_OFF: return x;
+    case SH_OVRDRV: return triodef(x * k.tube_g) * 0.6f;
+    case SH_DIST: { float g = 1 + k.rat_hi; return diodef(softf(x * (g > 200 ? 200 : g) * 2 / 15) * 7.5f) * 0.6f; }
+    case SH_FUZZ: return cubicf(cubicf(x * k.war_g) * k.war_g) * 0.6f;
+    case SH_DECIM: { float n = (float)k.decim_n; return floorf(x * 8 / n * 2) / (8 / n * 2); }
+    default: { shp_t s; memset(&s, 0, sizeof s); return shape1(ty, &s, &k, x); }
     }
 }
 
@@ -167,7 +354,9 @@ typedef struct {
     bq ap0b, ap0c, ap1c;            /* band 0 needs AP at x2 and x3, band 1 at x3 (built per block) */
     float cx[3], cslope;            /* the settings the coefficients were made for */
     int cbands;
-    float fbz[4][2], fbt[4][2];     /* each band's feedback (last output) and its tone filter */
+    shp_t sh[4][2];                 /* each band's shaper, per channel */
+    float fl[4][2], fb[4][2], fy[4][2];   /* FEEDBACK: the loop's band-pass (low, band) and the band's last output */
+    float fai[4][2], fao[4][2];     /* .. the shaper's mean level in and out (its gain, undone in the loop) */
     float sv1[2], sv2[2];           /* DJ filter (TPT SVF) */
     float dc_x[2], dc_y[2];
     float glv[4], gdr[4], gfb[4];   /* smoothed band gains */
@@ -224,6 +413,7 @@ void xl_engine_init(void)
     R.rsb = calloc((size_t)R.rsmax * 2, sizeof(float));
     R.rep = calloc((size_t)XL_SR * 2 * 2, sizeof(float));
     for (t = 0; t < XL_NTRK; t++) R.deck[t].cbands = -1;
+    shaper_init();
     XL.v.scene_playing = XL.v.scene_queued = -1;
     XL.v.morph_t = -1;
     for (t = 0; t < XL_NTRK; t++) { int i; for (i = 0; i < XL_NVOICE; i++) XL.v.vpos[t][i] = -1; }
@@ -321,7 +511,7 @@ static void deck_coefs(deck_t *k, const xl_track *t)
     if (bands != k->cbands || slope != k->cslope) {   /* a new layout: start clean */
         memset(k->lp, 0, sizeof k->lp); memset(k->hp, 0, sizeof k->hp);
         memset(&k->ap0b, 0, sizeof k->ap0b); memset(&k->ap0c, 0, sizeof k->ap0c); memset(&k->ap1c, 0, sizeof k->ap1c);
-        memset(k->fbz, 0, sizeof k->fbz); memset(k->fbt, 0, sizeof k->fbt);
+        memset(k->fl, 0, sizeof k->fl); memset(k->fb, 0, sizeof k->fb); memset(k->fy, 0, sizeof k->fy);
     }
     for (i = 0; i < 3; i++) {
         bq c;
@@ -357,14 +547,23 @@ static void deck_run(int t, float *buf, int n)
     const xl_track *tk = &XL.trk[t];
     int bands = (int)tk->p[P_BANDS], f, c, b, ty[4];
     float sgn = tk->p[P_SLOPE] >= 0.5f ? 1.0f : -1.0f;
-    float tlv[4], tdr[4], tfb[4], dj = tk->p[P_DJ], g1, gk, gR, sm = 1.0f / 64;
+    float tlv[4], tfb[4], fbf[4], dj = tk->p[P_DJ], g1, gk, gR, sm = 1.0f / 64;
+    shk_t sk[4];
     deck_coefs(k, tk);
     for (b = 0; b < 4; b++) {
         tlv[b] = db2lin(tk->p[P_LV0 + b]);
         if (b == 0 && R.kill[t]) tlv[b] = 0;
-        tdr[b] = tk->p[P_DR0 + b];
-        tfb[b] = tk->p[P_FB0 + b];
         ty[b] = (int)tk->p[P_TY0 + b];
+        if (ty[b] < 0 || ty[b] >= SH_N) ty[b] = SH_OFF;
+        shk_set(&sk[b], tk->p[P_DR0 + b]);
+        {   /* FEEDBACK: as SHARD's, 0 .. 127 -> a^2 x 4 (Q15): from about half the loop holds itself */
+            float a = tk->p[P_FB0 + b] / 0.95f * 127;
+            tfb[b] = a * a * 4 / 32768.0f;
+        }
+        {   /* the loop's band-pass sits in the band: between its crossovers (geometric), as SHARD's 150 / 900 / 4k */
+            float lo = b == 0 ? 40.0f : tk->p[P_X1 + b - 1], hi = b == bands - 1 ? 12000.0f : tk->p[P_X1 + b], fc = sqrtf(lo * hi);
+            fbf[b] = 2 * sinf((float)M_PI * (fc > 16000 ? 16000 : fc) / XL_SR);
+        }
     }
     {   /* DJ filter: below 0 a low-pass falling from 20 kHz, above 0 a high-pass rising from 20 Hz */
         float hz = dj < 0 ? 20000.0f * powf(80.0f / 20000.0f, -dj) : 20.0f * powf(8000.0f / 20.0f, dj);
@@ -375,7 +574,6 @@ static void deck_run(int t, float *buf, int n)
     for (f = 0; f < n; f++) {
         for (b = 0; b < 4; b++) {
             k->glv[b] += (tlv[b] - k->glv[b]) * sm;
-            k->gdr[b] += (tdr[b] - k->gdr[b]) * sm;
             k->gfb[b] += (tfb[b] - k->gfb[b]) * sm;
         }
         float inm = (buf[2 * f] + buf[2 * f + 1]) * 0.5f;
@@ -383,17 +581,38 @@ static void deck_run(int t, float *buf, int n)
             float x = buf[2 * f + c], bb[4], y = 0;
             deck_split(k, c, x, bands, sgn, bb);
             for (b = 0; b < bands; b++) {
-                float u = bb[b], dr = k->gdr[b], fb = k->gfb[b];
-                if (fb > 0.001f) {   /* feedback: the band's last output, through tanh and a tone low-pass */
-                    k->fbt[b][c] += (tanhf(k->fbz[b][c]) - k->fbt[b][c]) * 0.35f;
-                    u += fb * k->fbt[b][c];
+                float v = bb[b], fg = k->gfb[b];
+                if (fg > 0.0001f) {   /* FEEDBACK: the band's last output, band-passed (Q 2), back in */
+                    float hi, cq = 1;
+                    k->fl[b][c] = satf(k->fl[b][c] + fbf[b] * k->fb[b][c], 4);
+                    hi = satf(k->fy[b][c] - k->fl[b][c] - k->fb[b][c] * 0.5f, 4);
+                    k->fb[b][c] = satf(k->fb[b][c] + fbf[b] * hi, 4);
+                    if (ty[b] != SH_OFF) {   /* the shaper's gain undone (up to 4): quiet, the loop dies away */
+                        float o = k->fao[b][c] > 0.0156f ? k->fao[b][c] : 0.0156f;
+                        cq = k->fai[b][c] / o;
+                        cq = cq > 4 ? 4 : cq;
+                    }
+                    v += k->fb[b][c] * fg * cq;
                 }
-                if (dr > 0.001f) {
-                    float sh = shape(ty[b], u, 1.0f + dr * 30.0f), mix = dr * 8 > 1 ? 1 : dr * 8;
-                    u = u + (sh * (ty[b] == SH_TUBE ? 0.9f : 0.7f) - u) * mix;
+                if (ty[b] != SH_OFF) {
+                    float in = satf(v, 4), a = fabsf(in);
+                    v = shape_band(ty[b], &k->sh[b][c], &sk[b], in);
+                    if (fg > 0.0001f) {
+                        float m = fabsf(v);
+                        if (m > 0.366f) {   /* the howl's ceiling: bent over, 4:1, to 0.61 */
+                            m = 0.366f + (m - 0.366f) * 0.25f;
+                            m = m > 0.61f ? 0.61f : m;
+                            v = v < 0 ? -m : m;
+                        }
+                        k->fai[b][c] += (a - k->fai[b][c]) / 128;
+                        k->fao[b][c] += (fabsf(v) - k->fao[b][c]) / 128;
+                    }
+                } else {
+                    if (fg > 0.0001f) v = softf(satf(v, 3));   /* (no shaper: a soft clip holds the loop) */
+                    v = shape_band(SH_OFF, &k->sh[b][c], &sk[b], v);
                 }
-                k->fbz[b][c] = u;
-                y += u * k->glv[b];
+                k->fy[b][c] = satf(v, 2);
+                y += v * k->glv[b];
             }
             if (dj < -0.01f || dj > 0.01f) {   /* TPT state-variable filter */
                 float v3 = y - k->sv2[c];
@@ -406,7 +625,10 @@ static void deck_run(int t, float *buf, int n)
                 float o = y - k->dc_x[c] + 0.9995f * k->dc_y[c];
                 k->dc_x[c] = y; k->dc_y[c] = o; y = o;
             }
-            if (y != y || y > 64 || y < -64) { memset(k->fbz, 0, sizeof k->fbz); y = 0; }   /* (never NaN out) */
+            if (y != y || y > 64 || y < -64) {   /* (never NaN out) */
+                memset(k->fl, 0, sizeof k->fl); memset(k->fb, 0, sizeof k->fb); memset(k->fy, 0, sizeof k->fy);
+                memset(k->sh, 0, sizeof k->sh); y = 0;
+            }
             buf[2 * f + c] = y;
         }
         if (t == atomic_load_explicit(&XL.spec_track, memory_order_relaxed)) {

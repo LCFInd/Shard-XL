@@ -72,23 +72,57 @@ int main(void)
         for (i = N / 2; i < N; i++) if (fabsf(buf[2 * i]) > pk) pk = fabsf(buf[2 * i]);
         ck("deck: LOW at KILL takes a 50 Hz tone down by 30 dB or more", pk < 0.0316f);
     }
-    {   /* everything at its extreme: noise in, finite and bounded out */
+    {   /* everything at its extreme: noise in, finite and bounded out, every type in every band */
         static float buf[XL_SR * 2];
         xl_track *t = &XL.trk[0];
         float pk = 0;
-        int fin = 1;
+        int fin = 1, ty;
         xl_track_defaults(t);
         t->p[P_BANDS] = 4;
-        for (b = 0; b < 4; b++) { t->p[P_DR0 + b] = 1; t->p[P_FB0 + b] = 0.95f; t->p[P_TY0 + b] = (float)b; t->p[P_LV0 + b] = 12; }
-        for (s = 0; s < 3; s++) {
-            t->p[P_DJ] = s == 0 ? -1.0f : s == 1 ? 1.0f : 0.5f;
-            for (i = 0; i < XL_SR; i++) buf[2 * i] = buf[2 * i + 1] = (float)(rand() % 20001 - 10000) / 5000;
-            for (i = 0; i < XL_SR; i += 64) deck_run(0, buf + 2 * i, 64);
-            for (i = 0; i < 2 * XL_SR; i++) { if (buf[i] != buf[i]) fin = 0; if (fabsf(buf[i]) > pk) pk = fabsf(buf[i]); }
+        for (ty = 1; ty < SH_N; ty++) {
+            for (b = 0; b < 4; b++) { t->p[P_DR0 + b] = 1; t->p[P_FB0 + b] = 0.95f; t->p[P_TY0 + b] = (float)((ty + b - 1) % (SH_N - 1) + 1); t->p[P_LV0 + b] = 12; }
+            t->p[P_DJ] = ty % 3 == 0 ? -1.0f : ty % 3 == 1 ? 1.0f : 0.5f;
+            for (i = 0; i < XL_SR / 2; i++) buf[2 * i] = buf[2 * i + 1] = (float)(rand() % 20001 - 10000) / 5000;
+            for (i = 0; i < XL_SR / 2; i += 64) deck_run(0, buf + 2 * i, 64);
+            for (i = 0; i < XL_SR; i++) { if (buf[i] != buf[i]) fin = 0; if (fabsf(buf[i]) > pk) pk = fabsf(buf[i]); }
         }
-        ck("deck: every DRIVE, FEEDBACK and TYPE at its extreme stays finite", fin && pk < 64);
+        ck("deck: every TYPE with DRIVE and FEEDBACK at their extremes stays finite", fin && pk < 64);
     }
-
+    {   /* 4x: a 7 kHz tone through DIST at full DRIVE: what folds back below 20 kHz (not a harmonic) */
+        enum { N = 16384 };
+        static float buf[N * 2], re[N], im[N];
+        float alias[2];
+        int os;
+        for (os = 0; os < 2; os++) {
+            float fund = 0, al = 0;
+            xl_track *t = &XL.trk[0];
+            xl_os_off = !os;
+            xl_track_defaults(t);
+            t->p[P_BANDS] = 2; t->p[P_X1] = 100; t->p[P_TY1] = SH_DIST; t->p[P_DR1] = 1;
+            memset(&R.deck[0], 0, sizeof R.deck[0]); R.deck[0].cbands = -1;
+            for (i = 0; i < N; i++) buf[2 * i] = buf[2 * i + 1] = 0.5f * sinf(2 * (float)M_PI * 7000 * i / XL_SR);
+            for (i = 0; i < N; i += 64) deck_run(0, buf + 2 * i, 64);
+            for (i = 0; i < N; i++) { re[i] = buf[2 * i] * (0.5f - 0.5f * cosf(2 * (float)M_PI * i / N)); im[i] = 0; }
+            fft(re, im, N);
+            for (i = 4; i < N / 2; i++) {
+                float hz = (float)i * XL_SR / N, pw = re[i] * re[i] + im[i] * im[i], h = hz / 7000;
+                if (fabsf(hz - 7000) < 60) fund += pw;
+                else if (hz < 20000 && fabsf(h - floorf(h + 0.5f)) * 7000 > 150) al += pw;
+            }
+            alias[os] = 10 * log10f(al / fund + 1e-20f);
+        }
+        xl_os_off = 0;
+        {
+            char w[120];
+            snprintf(w, sizeof w, "deck: 4x cuts DIST's aliasing (%.0f dB at 1x, %.0f dB at 4x)", alias[0], alias[1]);
+            ck(w, alias[1] < alias[0] - 15);
+        }
+    }
+    {   /* every band in line: one band shaped, the rest OFF, still adds up flat at low DRIVE */
+        float dv, a5;
+        deck_response(3, 1, &dv, &a5);
+        ck("deck: with OFF everywhere the bands still add up flat (24 samples late)", dv < 0.5f);
+    }
     /* the sequencer: 16ths at 120 BPM, 2 bars -> 32 notes; ratchets, chance, every N */
     {
         static float out[2 * 4096];

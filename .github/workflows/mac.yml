@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Builds SHARD XL for Apple Silicon Macs on every push to main, runs the core's checks first, and publishes
+# the app to the release "mac-latest" as SHARD-XL-mac-<commit>.zip.
+name: mac
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the core
+        shell: bash
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee test.log
+      - name: Build the app
+        shell: bash
+        run: |
+          set -o pipefail
+          make app 2>&1 | tee build.log
+      - name: Show what failed
+        if: failure()
+        shell: bash
+        run: |
+          for f in test.log build.log; do
+            [ -f "$f" ] || continue
+            grep -E "error|FAIL|warning: " "$f" | head -40 | while IFS= read -r l; do echo "::error title=$f::$l"; done
+            tail -5 "$f" | while IFS= read -r l; do echo "::error title=$f (end)::$l"; done
+          done
+      - name: Package
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          ditto -c -k --keepParent "build/SHARD XL.app" "SHARD-XL-mac-$SHA.zip"
+          echo "ZIP=SHARD-XL-mac-$SHA.zip" >> "$GITHUB_ENV"
+      - name: Publish to the release mac-latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view mac-latest >/dev/null 2>&1; then
+            gh release create mac-latest --target "$GITHUB_SHA" --prerelease --title "SHARD XL for Mac (latest build)" \
+              --notes "The newest test build for Apple Silicon Macs, rebuilt on every change. Unzip, then open SHARD XL.app (see the README for the first start)."
+          fi
+          for a in $(gh release view mac-latest --json assets -q '.assets[].name'); do gh release delete-asset mac-latest "$a" -y; done
+          gh release upload mac-latest "$ZIP" --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHARD-XL-mac
+          path: ${{ env.ZIP }}

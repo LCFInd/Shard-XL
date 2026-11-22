@@ -4,7 +4,7 @@ at 1x and 2x (the Mac's Retina screens). Run from the repository root:  python3 
 from PIL import Image, ImageDraw, ImageFont
 
 TTF = 'assets/fonts/InterTight.ttf'
-SIZES = [(11, 500), (13, 500), (15, 600), (18, 600), (24, 700)]   # (pixel size at 1x, weight)
+SIZES = [(11, 500), (13, 500), (15, 600), (18, 600), (24, 700), (9, 600)]   # (pixel size at 1x, weight); append only
 EXTRA = [0xB7, 0x2013, 0xD7, 0xB5, 0xB0, 0x2192, 0x2190, 0x25B6, 0x25CF, 0x2026]   # · – × µ ° → ← ▶ ● …
 CODES = list(range(32, 127)) + EXTRA
 

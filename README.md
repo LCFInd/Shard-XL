@@ -43,7 +43,7 @@ scenes: press **Space** to play, click a scene on **SCENES** to switch at the ne
 | WAVE | the sample, its slices (auto, even, or by hand), reverse, normalize, stretch to the tempo |
 | DECK | the live spectrum in and out, crossovers to drag, each band's level as a red line, shaper and feedback per band, the DJ filter |
 | MIX | 8 channel strips, sends to Bus A, Bus B and the FX loop, the crossfader, returns, master |
-| SEQ | 8 tracks of up to 64 steps: chance, ratchets, "every Nth pass", Euclidean fills |
+| SEQ | 8 tracks of up to 64 steps, each showing the slice or note it plays; drag them in the lane under the grid; chance, ratchets, "every Nth pass", Euclidean fills |
 | SCENES | 8 scenes of every track's sound and pattern; launch on the bar, morph over 1 to 16 bars, or blend two by hand |
 | FILES | browse and hear samples, load them into a track |
 | SETUP | MIDI learning, the keyboard split, tempo, mutate amount, resample length |

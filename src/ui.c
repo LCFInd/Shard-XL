@@ -33,7 +33,7 @@ static const char *const PG_NAME[PG_N] = {"WAVE", "DECK", "MIX", "SEQ", "SCENES"
 /* ---- regions ---- */
 enum { R_NONE, R_TRK, R_TAB, R_PLAY, R_BPM, R_ACT, R_KNOB, R_WOV, R_WMAIN, R_CHIP, R_WBTN, R_DPLOT, R_DBANDS,
        R_DSLOPE, R_DCARD, R_MFADER, R_MPAN, R_MSEND, R_MMUTE, R_MSOLO, R_MSTRIP, R_XF, R_XCURVE, R_RET, R_SCELL,
-       R_SLANE, R_SVEL, R_SBTN, R_SCENE, R_SCBTN, R_FILE, R_FSRC, R_FBTN, R_FSCROLL, R_SETBTN, R_HELP };
+       R_SLANE, R_SVEL, R_SPITCH, R_SBTN, R_SCENE, R_SCBTN, R_FILE, R_FSRC, R_FBTN, R_FSCROLL, R_SETBTN, R_HELP };
 typedef struct { float x, y, w, h; int type, a, b; } region;
 static region RG[1024];
 static int NRG;
@@ -72,6 +72,7 @@ static struct {
     snap *und; int nund, uhead, redo_n;
     double autosave_t;
     float spec_pre[512], spec_post[512];
+    int plo, phi, pnote;   /* the pitch lane's range while dragging, and the note being heard */
 } U;
 
 static void msg(const char *fmt, ...)
@@ -983,6 +984,57 @@ static void euclid(xl_track *t, int k)
     }
     msg("%d of %d steps, spread evenly", k, n);
 }
+/* what a step plays, as a cell shows it: the slice number, or the note's name */
+static void step_label(const xl_track *t, const xl_step *st, char *b, int n)
+{
+    if ((int)t->p[P_ENGINE] == ENG_SHARD) snprintf(b, (size_t)n, "%d", st->note - 35);
+    else snprintf(b, (size_t)n, "%s", NOTE_N[st->note % 12]);
+}
+/* the pitch lane's range: the slices, or the notes in use (at least an octave) */
+static void seq_range(const xl_track *t, int *lo, int *hi)
+{
+    int s, len = (int)t->p[P_SLEN];
+    if ((int)t->p[P_ENGINE] == ENG_SHARD) {
+        int n = t->smp && t->smp->nsl > 0 ? t->smp->nsl : 1;
+        *lo = 36; *hi = 36 + (n > 1 ? n - 1 : 1);
+        return;
+    }
+    *lo = 127; *hi = 0;
+    for (s = 0; s < len; s++) if (t->st[s].on) { if (t->st[s].note < *lo) *lo = t->st[s].note; if (t->st[s].note > *hi) *hi = t->st[s].note; }
+    if (*lo > *hi) { *lo = 54; *hi = 66; }
+    *lo -= 3; *hi += 3;
+    while (*hi - *lo < 12) { (*lo)--; (*hi)++; }
+    if (*lo < 0) *lo = 0;
+    if (*hi > 127) *hi = 127;
+}
+static float seq_y(int v, int lo, int hi, float py, float ph) { return py + 10 + (float)(hi - v) / (hi - lo) * (ph - 20); }
+static int seq_v(float y, int lo, int hi, float py, float ph)
+{
+    int v = hi - (int)floorf((y - py - 10) / (ph - 20) * (hi - lo) + 0.5f);
+    return v < lo ? lo : v > hi ? hi : v;
+}
+#define SEQ_PY (CY0 + 34 + 8 * 34 + 8)
+#define SEQ_PH 112
+static void seq_pitch(float y, int first, int mods)
+{
+    xl_track *t = ST();
+    xl_step *st = &t->st[U.step];
+    int v;
+    if (first) {
+        undo_push();
+        seq_range(t, &U.plo, &U.phi);
+        U.pnote = -1;
+        if (mods & MOD_ALT) { st->on = 0; return; }
+    } else if (!st->on) return;
+    v = seq_v(y, U.plo, U.phi, SEQ_PY, SEQ_PH);
+    if (!st->on) { st->on = 1; if (st->prob == 0) st->prob = 100; if (st->vel == 0) st->vel = 100; }
+    st->note = (uint8_t)v;
+    if (v != U.pnote) {   /* hear it */
+        if (U.pnote >= 0) cmd(CMD_NOTE_OFF, sel(), U.pnote, 0, 0);
+        cmd(CMD_NOTE_ON, sel(), v, st->vel, 0);
+        U.pnote = v;
+    }
+}
 static void page_seq(void)
 {
     int t, s;
@@ -1008,49 +1060,69 @@ static void page_seq(void)
             else if (st->on) c = t == sel() ? C_R : C_T;
             else c = (s / 4) % 2 ? C_P : C_P2;
             d_rect(x, y + 2, 14, 24, c, 3);
-            if (s < len && st->on) {
+            if (s < len && st->on) {   /* what it plays, and its marks */
+                step_label(tk, st, b, sizeof b);
+                d_text(x + 7, y + 18, strlen(b) > 1 ? F9 : F11, C_BG, b, 1);
                 if (st->prob < 100) d_rect(x + 3, y + 4, 8, 2, C_BG, 1);
-                if (st->ratchet > 1) { int r; for (r = 0; r < st->ratchet; r++) d_rect(x + 2 + r * 3, y + 20, 2, 4, C_BG, 0); }
-                if (st->cond > 1) d_circle(x + 7, y + 13, 2.5f, C_BG);
+                if (st->ratchet > 1) { int r; for (r = 0; r < st->ratchet; r++) d_rect(x + 2 + r * 3, y + 22, 2, 3, C_BG, 0); }
+                if (st->cond > 1) d_circle(x + 11.5f, y + 6, 1.8f, C_BG);
             }
             if (pl && s == cur) d_frame(x, y + 2, 14, 24, C_T, 2, 3);
             if (t == sel() && s == U.step) d_frame(x - 1, y + 1, 16, 26, C_R, 1, 3);
             if (s < len) reg(x, y + 2, 15, 24, R_SLANE + 100, t, s);
         }
     }
-    {   /* the selected track: velocities and what each step plays */
+    {   /* the selected track: what each step plays (drag it up or down), and its velocity */
         xl_track *tk = ST();
-        float y = y0 + 8 * 34 + 14, h = 90;
-        int len = (int)tk->p[P_SLEN], shard = (int)tk->p[P_ENGINE] == ENG_SHARD;
+        float py = y0 + 8 * 34 + 8, ph = 112, vy = py + ph + 6, vh = 34;
+        int len = (int)tk->p[P_SLEN], shard = (int)tk->p[P_ENGINE] == ENG_SHARD, lo, hi, v;
+        seq_range(tk, &lo, &hi);
         snprintf(b, sizeof b, "Track %d", sel() + 1);
-        d_text(22, y + 20, F15, C_T, b, 0);
-        d_text(22, y + 40, F11, C_D, "velocity · and", 0);
-        d_text(22, y + 54, F11, C_D, shard ? "slice" : "note", 0);
+        d_text(22, py + 18, F15, C_T, b, 0);
+        d_text(22, py + 38, F11, C_D, shard ? "slice per step" : "note per step", 0);
+        d_text(22, py + 54, F11, C_D2, "drag up or down", 0);
+        d_text(22, py + 68, F11, C_D2, "Alt-click clears", 0);
+        d_text(22, vy + 22, F11, C_D, "velocity", 0);
+        d_rect(156, py, 1048, ph, C_P, 6);
+        {
+            int every = (int)ceilf(13.0f / ((ph - 20) / (float)(hi - lo)));   /* labels at least 13 px apart */
+            if (every < 1) every = 1;
+            for (v = lo; v <= hi; v++) {   /* a guide per slice, or per C */
+            float yc = seq_y(v, lo, hi, py, ph);
+            if (shard ? (v - lo) % every == 0 : v % 12 == 0) {
+                d_rect(156, yc, 1048, 1, C_P2, 0);
+                if (shard) snprintf(b, sizeof b, "%d", v - 35); else snprintf(b, sizeof b, "C%d", v / 12 - 2);
+                d_text(1210, yc + 4, F11, C_D2, b, 0);
+            }
+            }
+        }
         for (s = 0; s < len; s++) {
             float x = 158 + s * 16 + (s / 16) * 6;
             xl_step *st = &tk->st[s];
             if (st->on) {
-                float vh = st->vel / 127.0f * (h - 22);
-                d_rect(x, y + h - 22 - vh, 14, vh, s == U.step ? C_R : C_T, 2);
-                if (shard) snprintf(b, sizeof b, "%d", st->note - 35); else snprintf(b, sizeof b, "%s", NOTE_N[st->note % 12]);
-                d_text(x + 7, y + h - 6, F11, C_D, b, 1);
-            }
-            reg(x, y, 15, h - 20, R_SVEL, s, 0);
+                float yc = seq_y(st->note < lo ? lo : st->note > hi ? hi : st->note, lo, hi, py, ph);
+                float vv = st->vel / 127.0f * vh;
+                d_rect(x, yc - 8, 14, 16, s == U.step ? C_R : C_T, 3);
+                step_label(tk, st, b, sizeof b);
+                d_text(x + 7, yc + 4, strlen(b) > 1 ? F9 : F11, C_BG, b, 1);
+                d_rect(x, vy + vh - vv, 14, vv, s == U.step ? C_R : C_D, 2);
+            } else d_rect(x + 6, vy + vh - 2, 2, 2, C_L, 0);
+            reg(x - 1, py, 16, ph, R_SPITCH, s, 0);
+            reg(x - 1, vy, 16, vh, R_SVEL, s, 0);
         }
-        y += h + 8;
         {
-            float x = 158;
+            float x = 158, y = vy + vh + 6;
             int i;
             for (i = 0; i < 6; i++) {
                 float w = d_textw(F11, SB_L[i]) + 22;
-                button(x, y, w, 28, SB_L[i], 0, R_SBTN, i, 0);
+                button(x, y, w, 26, SB_L[i], 0, R_SBTN, i, 0);
                 x += w + 8;
             }
-            d_text(x + 8, y + 19, F11, C_D2, "bar in the cell: chance below 100% · ticks: ratchets · dot: plays 1 in N passes", 0);
+            d_text(x + 8, y + 18, F11, C_D2, "bar at the top of a step: chance below 100% · ticks: ratchets · dot: plays 1 in N passes", 0);
         }
     }
     (void)beat;
-    snprintf(b, sizeof b, "Step %d of track %d · click a step to turn it on or off, Shift-click to select it · REC + play: what you play lands on the steps", U.step + 1, sel() + 1);
+    snprintf(b, sizeof b, "Step %d of track %d · click a step to turn it on or off, Shift-click to select it · drag a step in the lane below to change what it plays", U.step + 1, sel() + 1);
     draw_knobs(b);
 }
 
@@ -1405,6 +1477,7 @@ void xl_ui_mouse(int type, float x, float y, int mods, int clicks)
             break;
         }
         case R_SVEL: U.step = r->a; undo_push(); xl_ui_mouse(MS_DRAG, x, y, mods, 0); break;
+        case R_SPITCH: U.step = r->a; seq_pitch(y, 1, mods); break;
         case R_SBTN: {
             xl_track *t = ST();
             int n = (int)t->p[P_SLEN], i;
@@ -1510,18 +1583,20 @@ void xl_ui_mouse(int type, float x, float y, int mods, int clicks)
         }
         case R_SVEL: {
             region *r = hit(x, y);
-            float y0 = CY0 + 34 + 8 * 34 + 14, h = 70, v;
+            float vy = SEQ_PY + SEQ_PH + 6, h = 34, v;
             if (r && r->type == R_SVEL) U.step = r->a;
-            v = (y0 + h - y) / h * 127;
+            v = (vy + h - y) / h * 127;
             ST()->st[U.step].vel = (uint8_t)(v < 1 ? 1 : v > 127 ? 127 : v);
             break;
         }
+        case R_SPITCH: seq_pitch(y, 0, mods); break;
         case R_FSCROLL: break;
         }
         (void)ddy;
         return;
     }
     if (type == MS_UP) {
+        if (U.dtype == R_SPITCH && U.pnote >= 0) { cmd(CMD_NOTE_OFF, sel(), U.pnote, 0, 0); U.pnote = -1; }
         if (U.dtype == R_WMAIN || U.dtype == R_CHIP) {
             if (U.db == 1) cmd(CMD_NOTE_OFF, sel(), (int)ST()->p[P_ENGINE] == ENG_SHARD ? 36 + U.slice : 60, 0, 0);
         }

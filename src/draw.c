@@ -126,7 +126,7 @@ static void d_circle(float cx, float cy, float rad, uint32_t c)
 }
 
 /* ---- text ---- */
-enum { F11, F13, F15, F18, F24 };
+enum { F11, F13, F15, F18, F24, F9 };
 static int utf8_next(const char **s)
 {
     const unsigned char *p = (const unsigned char *)*s;

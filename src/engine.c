@@ -54,6 +54,7 @@ const xl_pdesc XL_P[NP] = {
     [P_DJ] = {"DJ FILTER", -1, 1, 0, 0, 0, ""},
     [P_SLEN] = {"LENGTH", 1, 64, 16, PF_INT, 0, ""},
     [P_SDIV] = {"DIV", 0, DIV_N - 1, DIV_16, PF_ENUM, DIV_L, ""},
+    [P_GATE] = {"GATE", 5, 100, 50, PF_INT, 0, "%"},
 };
 const xl_pdesc XL_G[NG] = {
     [G_BPM] = {"BPM", 40, 240, 120, 0, 0, ""},
@@ -90,8 +91,7 @@ void xl_track_defaults(xl_track *t)
     int i;
     for (i = 0; i < NP; i++) t->p[i] = XL_P[i].def;
     memset(t->st, 0, sizeof t->st);
-    for (i = 0; i < XL_NSTEP; i++) { t->st[i].note = 60; t->st[i].vel = 100; t->st[i].prob = 100;
-                                     t->st[i].ratchet = 1; t->st[i].cond = 1; }
+    for (i = 0; i < XL_NSTEP; i++) { t->st[i].note[0] = 60; t->st[i].vel = 100; t->st[i].prob = 100; }
     for (i = 0; i < XL_NSLICE; i++) { t->slv[i] = 0; t->spit[i] = 0; t->srev[i] = 0; }
 }
 void xl_globals_defaults(float *g)
@@ -364,7 +364,7 @@ typedef struct {
 
 typedef struct {
     int on, note, track, rel, age, gate;   /* gate: frames left before the step's note-off (-1: held) */
-    double pos, inc;
+    double pos, inc, tinc;        /* tinc: where a SLIDE takes inc */
     int start, end, rev;
     float gain, env, atk, relk;
     const xl_sample *s;
@@ -379,7 +379,11 @@ typedef struct {
     /* sequencer */
     double next_beat[XL_NTRK], step_beat[XL_NTRK];
     int idx[XL_NTRK], pass[XL_NTRK];
-    double rat_beat[XL_NTRK][4]; int rat_n[XL_NTRK], rat_note[XL_NTRK], rat_vel[XL_NTRK];
+    double rat_beat[XL_NTRK][4]; int rat_n[XL_NTRK], rat_vel[XL_NTRK], rat_gate[XL_NTRK];
+    uint8_t rat_notes[XL_NTRK][4]; int rat_nn[XL_NTRK];
+    voice_t *slide[XL_NTRK];       /* the voice a SLIDE step left sounding into the next note */
+    int held[XL_NTRK], entry_open; /* step entry: keys held, the step taking them */
+    double rec_beat[XL_NTRK]; int rec_step[XL_NTRK];
     double beat;
     int was_playing;
     /* scenes */
@@ -440,23 +444,25 @@ static void voice_start(voice_t *v, int t, const xl_sample *s, int note, int vel
         v->start = 0; v->end = s->len; v->rev = 0;
         v->inc = powf(2.0f, (note - 60 + tune) / 12.0f);
     }
+    v->tinc = v->inc;
     v->pos = v->rev ? v->end - 1 : v->start;
     v->gain = vel / 127.0f * db2lin(lv);
     if (lv <= -59.5f) v->gain = 0;
     v->on = 1;
 }
-static void note_on(int t, int note, int vel, int gate)
+static voice_t *note_on(int t, int note, int vel, int gate)
 {
     xl_track *tk = &XL.trk[t];
     voice_t *best = 0;
     int i;
-    if (!tk->smp || tk->smp->len < 4) return;
+    if (!tk->smp || tk->smp->len < 4) return 0;
     for (i = 0; i < XL_NVOICE; i++) if (!R.v[t][i].on) { best = &R.v[t][i]; break; }
     if (!best) {
         best = &R.v[t][0];
         for (i = 1; i < XL_NVOICE; i++) if (R.v[t][i].age < best->age) best = &R.v[t][i];
     }
     voice_start(best, t, tk->smp, note, vel, gate);
+    return best;
 }
 static void note_off(int t, int note)
 {
@@ -482,6 +488,10 @@ static int voice_run(voice_t *v, float *acc, int n)
             r = b + 0.5f * fr * (c - a + fr * (2 * a - 5 * b + 4 * c - e + fr * (3 * (b - c) + e - a)));
         }
         if (v->gate > 0 && --v->gate == 0) v->rel = 1;
+        if (v->inc != v->tinc) {   /* SLIDE: ~60 ms to the next note's pitch */
+            v->inc += (v->tinc - v->inc) * (1.0 / (0.06 * XL_SR));
+            if (fabs(v->tinc - v->inc) < 1e-6) v->inc = v->tinc;
+        }
         if (v->rel) { v->env *= v->relk; if (v->env < 0.0005f) { v->on = 0; return 0; } }
         else if (v->env < 1) { v->env += v->atk; if (v->env > 1) v->env = 1; }
         {   /* a short fade at the slice's end */
@@ -652,7 +662,7 @@ static void seq_start(void)
 {
     int t;
     R.beat = 0;
-    for (t = 0; t < XL_NTRK; t++) { R.next_beat[t] = 0; R.idx[t] = 0; R.pass[t] = 0; R.rat_n[t] = 0; }
+    for (t = 0; t < XL_NTRK; t++) { R.next_beat[t] = 0; R.idx[t] = 0; R.pass[t] = 0; R.rat_n[t] = 0; R.slide[t] = 0; }
 }
 static int track_audible(int t)
 {
@@ -661,29 +671,71 @@ static int track_audible(int t)
     if (any) return XL.trk[t].p[P_SOLO] >= 0.5f;
     return XL.trk[t].p[P_MUTE] < 0.5f;
 }
+/* a step's chance or condition, on pass `pass` of its track (as SHARD's seq_cond) */
+static const uint8_t COND_A[9] = {1, 2, 1, 2, 3, 1, 2, 3, 4}, COND_B[9] = {2, 2, 3, 3, 3, 4, 4, 4, 4};
+static int step_plays(const xl_step *s, int pass)
+{
+    if (s->prob >= COND_FIRST) {
+        int c = s->prob - COND_FIRST;
+        if (c < 9) return pass % COND_B[c] == COND_A[c] - 1;
+        if (c == 9) return atomic_load_explicit(&XL.fill_held, memory_order_relaxed) != 0;
+        return atomic_load_explicit(&XL.fill_held, memory_order_relaxed) == 0;
+    }
+    return s->prob >= 100 || (int)(xr() % 100) < s->prob;
+}
+static double step_dur(int div, int i, double st, double sw)
+{
+    return (div == DIV_8 || div == DIV_16) ? st * (i % 2 == 0 ? 1 + sw : 1 - sw) : st;
+}
 static void seq_block(double b0, double b1, double spb /* samples per beat */)
 {
     int t;
     for (t = 0; t < XL_NTRK; t++) {
         xl_track *tk = &XL.trk[t];
-        int len = (int)tk->p[P_SLEN], div = (int)tk->p[P_SDIV];
+        int len = (int)tk->p[P_SLEN], div = (int)tk->p[P_SDIV], shard = (int)tk->p[P_ENGINE] == ENG_SHARD;
         double st = DIV_BEATS[div < 0 || div >= DIV_N ? DIV_16 : div];
-        double sw = (XL.g[G_SWING] - 50) / 50.0;
+        double sw = (XL.g[G_SWING] - 50) / 50.0, gate = tk->p[P_GATE] / 100.0;
         if (len < 1) len = 1;
         if (len > XL_NSTEP) len = XL_NSTEP;
         while (R.next_beat[t] < b1) {
             int i = R.idx[t] % len;
             xl_step *s = &tk->st[i];
-            double dur = st;
-            if (div == DIV_8 || div == DIV_16) dur = st * (i % 2 == 0 ? 1 + sw : 1 - sw);
+            double dur = step_dur(div, i, st, sw);
             XL.v.step[t] = i;
-            if (s->on && (s->cond <= 1 || R.pass[t] % s->cond == 0) && (int)(xr() % 100) < s->prob) {
-                int r = s->ratchet < 1 ? 1 : s->ratchet > 4 ? 4 : s->ratchet, k;
-                int gate = (int)(dur / r * 0.8 * spb);
-                note_on(t, s->note, s->vel, gate < 32 ? 32 : gate);
+            if (step_on(s) && step_plays(s, R.pass[t])) {
+                int r = step_ratchet(s), ties = 0, k, vel = (s->flags & SF_ACCENT) ? 127 : s->vel, slides = 0;
+                double hold;
+                while (ties < len - 1 && tk->st[(i + 1 + ties) % len].time == ST_TIE) ties++;
+                hold = r > 1 ? dur / r * gate : (ties + gate) * dur;
+                if ((s->flags & SF_SLIDE) && r == 1) {   /* SLIDE: held into the next note, which glides there */
+                    const xl_step *nx = &tk->st[(i + 1 + ties) % len];
+                    if (step_on(nx)) { hold = (ties + 1) * dur + st * 0.25; slides = 1; }
+                }
+                if (R.slide[t] && R.slide[t]->on && !R.slide[t]->rel && !shard && s->n >= 1 && r == 1) {
+                    voice_t *v = R.slide[t];   /* coming from a SLIDE: no new attack, the pitch glides */
+                    v->tinc = powf(2.0f, (s->note[0] - 60 + tk->p[P_TUNE]) / 12.0f);
+                    v->note = s->note[0];
+                    v->gate = (int)(hold * spb);
+                    R.slide[t] = slides ? v : 0;
+                } else {
+                    voice_t *v0 = 0;
+                    if (R.slide[t] && R.slide[t]->on) R.slide[t]->rel = 1;
+                    for (k = 0; k < s->n && k < 4; k++) {
+                        int g = (int)(hold * spb);
+                        voice_t *v = note_on(t, s->note[k], vel, g < 32 ? 32 : g);
+                        if (!k) v0 = v;
+                    }
+                    R.slide[t] = slides ? v0 : 0;
+                }
                 R.rat_n[t] = 0;
-                for (k = 1; k < r; k++) R.rat_beat[t][R.rat_n[t]++] = R.next_beat[t] + dur * k / r;
-                R.rat_note[t] = s->note; R.rat_vel[t] = s->vel;
+                if (r > 1) {
+                    for (k = 1; k < r; k++) R.rat_beat[t][R.rat_n[t]++] = R.next_beat[t] + dur * k / r;
+                    memcpy(R.rat_notes[t], s->note, 4); R.rat_nn[t] = s->n; R.rat_vel[t] = vel;
+                    R.rat_gate[t] = (int)(dur / r * gate * spb);
+                }
+            } else if (s->time != ST_TIE && R.slide[t]) {
+                if (R.slide[t]->on) R.slide[t]->rel = 1;
+                R.slide[t] = 0;
             }
             R.step_beat[t] = R.next_beat[t];
             R.next_beat[t] += dur;
@@ -691,11 +743,11 @@ static void seq_block(double b0, double b1, double spb /* samples per beat */)
             if (R.idx[t] % len == 0) R.pass[t]++;
         }
         {   /* ratchets due in this block */
-            int k, m = 0;
+            int k, m = 0, j;
             for (k = 0; k < R.rat_n[t]; k++) {
                 if (R.rat_beat[t][k] < b1) {
-                    int gate = (int)(st / 4 * 0.8 * spb);
-                    note_on(t, R.rat_note[t], R.rat_vel[t], gate < 32 ? 32 : gate);
+                    for (j = 0; j < R.rat_nn[t] && j < 4; j++)
+                        note_on(t, R.rat_notes[t][j], R.rat_vel[t], R.rat_gate[t] < 32 ? 32 : R.rat_gate[t]);
                 } else R.rat_beat[t][m++] = R.rat_beat[t][k];
             }
             R.rat_n[t] = m;
@@ -703,18 +755,50 @@ static void seq_block(double b0, double b1, double spb /* samples per beat */)
     }
     (void)b0;
 }
-/* a note played while REC is on lands on the nearest step */
+static void step_add(xl_step *s, int note)
+{
+    int j;
+    for (j = 0; j < s->n; j++) if (s->note[j] == note) return;
+    if (s->n < 4) s->note[s->n++] = (uint8_t)note;
+}
+/* REC while playing: a note lands on the nearest step; notes played together (40 ms) make a chord */
 static void rec_note(int t, int note, int vel)
 {
     xl_track *tk = &XL.trk[t];
     int len = (int)tk->p[P_SLEN], div = (int)tk->p[P_SDIV], i;
     double st = DIV_BEATS[div < 0 || div >= DIV_N ? DIV_16 : div];
+    xl_step *s;
     if (len < 1) len = 1;
     i = (R.idx[t] - 1) % len;
     if (R.beat - R.step_beat[t] > st * 0.5) i = R.idx[t] % len;
     if (i < 0) i += len;
-    tk->st[i].on = 1; tk->st[i].note = (uint8_t)note; tk->st[i].vel = (uint8_t)vel;
-    tk->st[i].prob = 100; if (tk->st[i].ratchet < 1) tk->st[i].ratchet = 1; if (tk->st[i].cond < 1) tk->st[i].cond = 1;
+    s = &tk->st[i];
+    if (!(R.rec_step[t] == i && R.beat - R.rec_beat[t] < 0.04 * XL.g[G_BPM] / 60) || !step_on(s)) s->n = 0;
+    s->time = ST_NOTE;
+    step_add(s, note);
+    s->vel = (uint8_t)vel;
+    if (s->prob == 0) s->prob = 100;
+    R.rec_step[t] = i; R.rec_beat[t] = R.beat;
+}
+/* REC while stopped: step entry, as SHARD's: the keys held together become the cursor step; letting go of them all
+ * moves the cursor on (inside LENGTH) */
+static void entry_note(int t, int note, int vel)
+{
+    xl_track *tk = &XL.trk[t];
+    int c = atomic_load(&XL.cursor), len = (int)tk->p[P_SLEN];
+    xl_step *s;
+    if (len < 1) len = 1;
+    c %= len;
+    s = &tk->st[c];
+    if (vel > 0) {
+        if (!R.entry_open) { R.entry_open = 1; s->n = 0; s->time = ST_NOTE; if (s->prob == 0) s->prob = 100; }
+        step_add(s, note);
+        s->vel = (uint8_t)vel;
+        R.held[t]++;
+    } else if (R.held[t] > 0 && --R.held[t] == 0 && R.entry_open) {
+        R.entry_open = 0;
+        atomic_store(&XL.cursor, (c + 1) % len);
+    }
 }
 
 /* ---- scenes ---- */
@@ -787,10 +871,12 @@ static int note_track(int note, int chan)
 }
 static void handle_note(int t, int note, int vel)
 {
+    int rec = atomic_load(&XL.rec), pl = atomic_load(&XL.playing);
     if (vel > 0) {
         note_on(t, note, vel, -1);
-        if (atomic_load(&XL.rec) && atomic_load(&XL.playing)) rec_note(t, note, vel);
+        if (rec && pl) rec_note(t, note, vel);
     } else note_off(t, note);
+    if (rec && !pl && t == atomic_load(&XL.sel_track)) entry_note(t, note, vel);
 }
 static void scene_request(int s, int bars)
 {
@@ -824,10 +910,8 @@ static void cmd_block(void)
     xl_msg m;
     while (xl_q_pop(&XL_CMD, &m)) {
         switch (m.type) {
-        case CMD_NOTE_ON: note_on(m.a, m.b, m.c, -1);
-            if (atomic_load(&XL.rec) && atomic_load(&XL.playing)) rec_note(m.a, m.b, m.c);
-            break;
-        case CMD_NOTE_OFF: note_off(m.a, m.b); break;
+        case CMD_NOTE_ON: if (m.ptr) note_on(m.a, m.b, m.c > 0 ? m.c : 1, -1); else handle_note(m.a, m.b, m.c > 0 ? m.c : 1); break;
+        case CMD_NOTE_OFF: if (m.ptr) note_off(m.a, m.b); else handle_note(m.a, m.b, 0); break;   /* (ptr: hear it only) */
         case CMD_PLAY: seq_start(); atomic_store(&XL.playing, 1); break;
         case CMD_STOP: {
             int t, i;

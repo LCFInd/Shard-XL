@@ -43,7 +43,7 @@ scenes: press **Space** to play, click a scene on **SCENES** to switch at the ne
 | WAVE | the sample, its slices (auto, even, or by hand), reverse, normalize, stretch to the tempo |
 | DECK | the live spectrum in and out, crossovers to drag, each band's level as a red line; per band SHARD's DRIVE types (OVRDRV, DIST, FOLD, CRUSH, DECIM, HALF, TUBE, FUZZ, 4x oversampled) and feedback; the DJ filter |
 | MIX | 8 channel strips, sends to Bus A, Bus B and the FX loop, the crossfader, returns, master |
-| SEQ | 8 tracks of up to 64 steps, each showing the slice or note it plays; drag them in the lane under the grid; chance, ratchets, "every Nth pass", Euclidean fills |
+| SEQ | SHARD's sequencer: 8 tracks of up to 64 steps in pages of 16; a step holds up to 4 notes (a chord) or slices, NOTE / TIE / REST, accent, slide, ratchet, velocity, a chance or a condition (1:2 … 4:4, FILL); GATE per track; a roll of the selected track to edit by mouse; step entry with REC while stopped |
 | SCENES | 8 scenes of every track's sound and pattern; launch on the bar, morph over 1 to 16 bars, or blend two by hand |
 | FILES | browse and hear samples, load them into a track |
 | SETUP | MIDI learning, the keyboard split, tempo, mutate amount, resample length |

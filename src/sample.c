@@ -311,6 +311,12 @@ static void clang(xl_sample *s, int at, float f0, float g)
         put(s, at + i, v, sinf(2 * (float)M_PI * f0 * 1.01f * t + m) * 0.6f * expf(-t * 4) * g);
     }
 }
+static void note1(xl_step *s, int note)   /* one note on a step */
+{
+    s->time = ST_NOTE; s->n = 1; s->note[0] = (uint8_t)note;
+    if (!s->vel) s->vel = 100;
+    if (!s->prob) s->prob = 100;
+}
 static void set_track(int t, xl_sample *s, int eng)
 {
     XL.trk[t].smp = s;
@@ -368,24 +374,30 @@ void xl_demo_kit(void)
       } }
     xl_sample_peaks(s); set_track(5, s, ENG_SAMPLE);
     /* tracks 7 and 8: empty, for resampling */
-    /* patterns */
+    /* patterns (SHARD-style steps: notes, ties, accents, slides, chords) */
     {
         xl_track *d = &XL.trk[0], *b = &XL.trk[1], *m = &XL.trk[2], *k = &XL.trk[4];
         int ns = d->smp->nsl;
-        for (i = 0; i < 16; i++) {
-            if (i % 2 == 0) { d->st[i].on = 1; d->st[i].note = (uint8_t)(36 + (i / 2) % (ns > 0 ? ns : 1)); }
-        }
-        d->st[14].ratchet = 3;
+        for (i = 0; i < 16; i++) if (i % 2 == 0) note1(&d->st[i], 36 + (i / 2) % (ns > 0 ? ns : 1));
+        d->st[14].flags |= 2u << SF_RATCH_SH;   /* (x3) */
+        d->st[0].flags |= SF_ACCENT; d->st[8].flags |= SF_ACCENT;
         { const int bn[16] = {36, 0, 36, 48, 0, 36, 39, 0, 36, 0, 43, 36, 0, 41, 39, 0};
-          for (i = 0; i < 16; i++) if (bn[i]) { b->st[i].on = 1; b->st[i].note = (uint8_t)(bn[i] + 24); b->st[i].vel = (uint8_t)(i % 4 ? 90 : 120); } }
-        m->st[3].on = 1; m->st[3].note = 36; m->st[11].on = 1; m->st[11].note = 38; m->st[11].prob = 60;
+          for (i = 0; i < 16; i++) if (bn[i]) { note1(&b->st[i], bn[i] + 24); b->st[i].vel = (uint8_t)(i % 4 ? 90 : 120); } }
+        b->st[1].time = ST_TIE;                 /* the first note held two steps */
+        b->st[6].flags |= SF_SLIDE;             /* D# slides into C */
+        b->st[13].flags |= SF_SLIDE | SF_ACCENT;
+        note1(&m->st[3], 36); note1(&m->st[11], 38); m->st[11].prob = 60;
+        m->st[7].time = ST_NOTE; note1(&m->st[7], 40); m->st[7].prob = COND_FIRST + 0;   /* 1:2 */
         m->p[P_SENDFX] = 0.5f; m->p[P_LEVEL] = -10;
-        for (i = 0; i < 16; i++) { k->st[i].on = 1; k->st[i].note = (uint8_t)(36 + i); k->st[i].vel = 80; }
+        for (i = 0; i < 16; i++) { note1(&k->st[i], 36 + i); k->st[i].vel = 80; }
         k->p[P_MUTE] = 1;
-        XL.trk[3].st[0].on = 1; XL.trk[3].st[0].note = 60; XL.trk[3].p[P_SLEN] = 32; XL.trk[3].p[P_LEVEL] = -12;
+        note1(&XL.trk[3].st[0], 60);
+        for (i = 1; i < 16; i++) XL.trk[3].st[i].time = ST_TIE;   /* the drone: one note held a bar */
+        XL.trk[3].p[P_SLEN] = 32; XL.trk[3].p[P_LEVEL] = -12;
         XL.trk[3].p[P_REL] = 800;
         XL.trk[1].p[P_TY1] = SH_OVRDRV; XL.trk[1].p[P_DR1] = 0.25f; XL.trk[1].p[P_LV2] = -6;
-        XL.trk[5].p[P_MUTE] = 1; XL.trk[5].st[0].on = 1; XL.trk[5].st[6].on = 1; XL.trk[5].st[0].note = 60; XL.trk[5].st[6].note = 63;
+        XL.trk[5].p[P_MUTE] = 1; note1(&XL.trk[5].st[0], 60);
+        note1(&XL.trk[5].st[6], 58); XL.trk[5].st[6].note[1] = 63; XL.trk[5].st[6].n = 2;   /* a chord */
         XL.trk[5].p[P_SENDFX] = 0.4f;
         for (t = 0; t < 6; t++) XL.trk[t].p[P_SENDB] = t % 2 ? 0.5f : 0.2f;
     }

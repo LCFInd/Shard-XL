@@ -31,6 +31,7 @@ enum {
     P_DR0, P_DR1, P_DR2, P_DR3,
     P_FB0, P_FB1, P_FB2, P_FB3,
     P_DJ, P_SLEN, P_SDIV,
+    P_GATE,                    /* (appended 2026-11-28: the project file stores these by index) */
     NP
 };
 /* Global settings (not per track). */
@@ -47,9 +48,21 @@ enum {
 typedef struct { const char *name; float min, max, def; int flags; const char *const *labels; const char *unit; } xl_pdesc;
 extern const xl_pdesc XL_P[NP], XL_G[NG];
 
-typedef struct {               /* one step of a track's pattern */
-    uint8_t on, note, vel, prob, ratchet, cond;
+/* one step of a track's pattern, as SHARD's (Felucca's acid-style step): up to 4 notes (a chord; on a SHARD track a
+ * note is a slice, 36 = slice 1), NOTE / TIE (holds the note before on) / REST, accent, slide, ratchet, velocity,
+ * and a chance (0..100 %) or a condition (COND_FIRST + c: 1:2 2:2 1:3 2:3 3:3 1:4 2:4 3:4 4:4 FILL !FILL) */
+enum { ST_NOTE, ST_TIE, ST_REST };
+#define SF_ACCENT 1u
+#define SF_SLIDE 2u
+#define SF_RATCH_SH 3u                 /* the hits of a NOTE step - 1 (0..3: x1..x4) */
+#define SF_RATCH (3u << SF_RATCH_SH)
+#define COND_FIRST 102u
+#define NCOND 11u
+typedef struct {
+    uint8_t note[4], n, time, flags, vel, prob;
 } xl_step;
+static inline int step_on(const xl_step *s) { return s->time == ST_NOTE && s->n > 0; }
+static inline int step_ratchet(const xl_step *s) { return (int)((s->flags & SF_RATCH) >> SF_RATCH_SH) + 1; }
 
 typedef struct xl_sample {     /* stereo, 48 kHz, interleaved */
     float *d;
@@ -93,7 +106,8 @@ typedef struct {               /* the whole shared state */
     xl_track trk[XL_NTRK];
     float g[NG];
     xl_scene scene[XL_NSCENE];
-    atomic_int playing, rec, sel_track, spec_track, shift_held;
+    atomic_int playing, rec, sel_track, spec_track, shift_held, fill_held;
+    atomic_int cursor;         /* the step being edited on the selected track (step entry writes there) */
     xl_view v;
     char home[1024];           /* ~/Music/SHARD-XL */
 } xl_state;

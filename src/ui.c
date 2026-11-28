@@ -29,6 +29,7 @@ static const char *const PG_NAME[PG_N] = {"WAVE", "DECK", "MIX", "SEQ", "SCENES"
 #define ACT 40
 #define KY 612
 #define CY0 (TOP + ACT)
+#define CUR (atomic_load(&XL.cursor))
 
 /* ---- regions ---- */
 enum { R_NONE, R_TRK, R_TAB, R_PLAY, R_BPM, R_ACT, R_KNOB, R_WOV, R_WMAIN, R_CHIP, R_WBTN, R_DPLOT, R_DBANDS,
@@ -72,7 +73,8 @@ static struct {
     snap *und; int nund, uhead, redo_n;
     double autosave_t;
     float spec_pre[512], spec_post[512];
-    int plo, phi, pnote;   /* the pitch lane's range while dragging, and the note being heard */
+    int plo, phi, pnote;   /* the roll's range while dragging, and the note being heard */
+    int grab, seqtrack, lastnote;   /* the roll: the chord note dragged; SEQ's knobs: 0 the step, 1 the track */
 } U;
 
 static void msg(const char *fmt, ...)
@@ -132,21 +134,46 @@ static void redo(void)
 }
 
 /* ---- values and their text ---- */
-static const char *const COND_L[] = {"", "ALWAYS", "1 IN 2", "1 IN 3", "1 IN 4", "1 IN 5", "1 IN 6", "1 IN 7", "1 IN 8"};
+static const char *const TIME_L[] = {"NOTE", "TIE", "REST"};
+static const char *const FLAG_L[] = {"-", "ACC", "SLD", "A+S"};
+static const char *const COND_N[NCOND] = {"1:2", "2:2", "1:3", "2:3", "3:3", "1:4", "2:4", "3:4", "4:4", "FILL", "!FILL"};
 static xl_pdesc KD_SLSEL = {"SLICE", 1, 64, 1, PF_INT, 0, ""}, KD_SLV = {"S.LEVEL", -60, 12, 0, 0, 0, "dB"},
                 KD_SPIT = {"S.PITCH", -24, 24, 0, 0, 0, "st"}, KD_NOTE = {"NOTE", 0, 127, 60, PF_INT, 0, "note"},
                 KD_SLNOTE = {"SLICE", 36, 99, 36, PF_INT, 0, "slice"}, KD_VEL = {"VELOCITY", 1, 127, 100, PF_INT, 0, ""},
-                KD_PROB = {"CHANCE", 0, 100, 100, PF_INT, 0, "%"}, KD_RAT = {"RATCHET", 1, 4, 1, PF_INT, 0, "x"},
-                KD_COND = {"EVERY", 1, 8, 1, PF_ENUM, COND_L, ""}, KD_NONE = {"", 0, 1, 0, 0, 0, ""};
+                KD_STEPNO = {"STEP", 1, 64, 1, PF_INT, 0, ""}, KD_LEN = {"LEN", 1, 16, 1, PF_INT, 0, "steps"},
+                KD_TIME = {"TIME", 0, 2, 0, PF_ENUM, TIME_L, ""}, KD_FLAG = {"FLAG", 0, 3, 0, PF_ENUM, FLAG_L, ""},
+                KD_CHANCE = {"CHANCE", 0, 100 + NCOND, 100, PF_INT, 0, "chance"}, KD_RAT = {"RATCHET", 1, 4, 1, PF_INT, 0, "x"},
+                KD_NONE = {"", 0, 1, 0, 0, 0, ""};
 static xl_pdesc KD_TLV[XL_NTRK], KD_XO[3];
 static const char *const NOTE_N[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
 
 static int is_shard(void) { return (int)ST()->p[P_ENGINE] == ENG_SHARD; }
+static int slen(void) { int n = (int)ST()->p[P_SLEN]; return n < 1 ? 1 : n > XL_NSTEP ? XL_NSTEP : n; }
+static int cur(void) { int c = CUR; return c < 0 ? 0 : c >= slen() ? slen() - 1 : c; }
+static void cursor_set(int c) { int n = slen(); atomic_store(&XL.cursor, ((c % n) + n) % n); }
+/* a NOTE step's length: itself and the TIEs after it (as SHARD's note_len) */
+static int note_len(const xl_track *t, int i)
+{
+    int n = 1, len = (int)t->p[P_SLEN];
+    while (i + n < len && t->st[i + n].time == ST_TIE) n++;
+    return n;
+}
+static void set_len(xl_track *t, int i, int n)
+{
+    int len = (int)t->p[P_SLEN], k;
+    for (k = 1; k < n && i + k < len; k++) t->st[i + k].time = ST_TIE;
+    if (i + k < len && t->st[i + k].time == ST_TIE) t->st[i + k].time = ST_REST;   /* (the old tail ends) */
+}
+static int default_note(const xl_track *t, int i)   /* what a step clicked on plays: its slice, or the last note */
+{
+    if ((int)t->p[P_ENGINE] == ENG_SHARD) return 36 + i % (t->smp && t->smp->nsl > 0 ? t->smp->nsl : 1);
+    return U.lastnote ? U.lastnote : 60;
+}
 static int nslices(void) { xl_sample *s = ST()->smp; return s ? s->nsl : 1; }
 static float kget(kref k, const xl_pdesc **d)
 {
     xl_track *t = ST();
-    xl_step *s = &t->st[U.step];
+    xl_step *s;
     switch (k.kind) {
     case KR_TP: *d = &XL_P[k.id]; return t->p[k.id];
     case KR_BAND: *d = &XL_P[k.id + U.band]; return t->p[k.id + U.band];
@@ -155,12 +182,16 @@ static float kget(kref k, const xl_pdesc **d)
     case KR_SLV: *d = &KD_SLV; return t->slv[U.slice];
     case KR_SPIT: *d = &KD_SPIT; return t->spit[U.slice];
     case KR_STEP:
+        s = &t->st[cur()];
         switch (k.id) {
-        case 0: *d = is_shard() ? &KD_SLNOTE : &KD_NOTE; return s->note;
-        case 1: *d = &KD_VEL; return s->vel;
-        case 2: *d = &KD_PROB; return s->prob;
-        case 3: *d = &KD_RAT; return s->ratchet;
-        default: *d = &KD_COND; return s->cond;
+        case 0: KD_STEPNO.max = (float)slen(); *d = &KD_STEPNO; return (float)(cur() + 1);
+        case 1: *d = is_shard() ? &KD_SLNOTE : &KD_NOTE; return s->note[0];
+        case 2: if (step_on(s)) { KD_LEN.max = (float)(slen() - cur()); *d = &KD_LEN; return (float)note_len(t, cur()); }
+                *d = &KD_TIME; return s->time;
+        case 3: *d = &KD_FLAG; return (float)(((s->flags & SF_ACCENT) ? 1 : 0) | ((s->flags & SF_SLIDE) ? 2 : 0));
+        case 4: *d = &KD_VEL; return s->vel;
+        case 5: *d = &KD_CHANCE; return s->prob >= COND_FIRST ? (float)(s->prob - COND_FIRST + 101) : s->prob;
+        default: *d = &KD_RAT; return (float)step_ratchet(s);
         }
     case KR_TLV: *d = &KD_TLV[k.id]; return XL.trk[k.id].p[P_LEVEL];
     case KR_XO: {
@@ -179,7 +210,7 @@ static void apply_manual_morph(void);
 static void kset(kref k, float v)
 {
     xl_track *t = ST();
-    xl_step *s = &t->st[U.step];
+    xl_step *s;
     const xl_pdesc *d;
     kget(k, &d);
     v = xl_pval(d, v);
@@ -191,12 +222,17 @@ static void kset(kref k, float v)
     case KR_SLV: t->slv[U.slice] = v; break;
     case KR_SPIT: t->spit[U.slice] = v; break;
     case KR_STEP:
+        s = &t->st[cur()];
         switch (k.id) {
-        case 0: s->note = (uint8_t)v; break;
-        case 1: s->vel = (uint8_t)v; break;
-        case 2: s->prob = (uint8_t)v; break;
-        case 3: s->ratchet = (uint8_t)v; break;
-        default: s->cond = (uint8_t)v; break;
+        case 0: cursor_set((int)v - 1); break;
+        case 1: if (!step_on(s)) note1(s, (int)v); else { int dn = (int)v - s->note[0], j;   /* (a chord moves whole) */
+                    for (j = 0; j < s->n; j++) { int x = s->note[j] + dn; s->note[j] = (uint8_t)(x < 0 ? 0 : x > 127 ? 127 : x); } }
+                U.lastnote = s->note[0]; break;
+        case 2: if (step_on(s)) set_len(t, cur(), (int)v); else s->time = (uint8_t)v; break;
+        case 3: s->flags = (uint8_t)((s->flags & ~(SF_ACCENT | SF_SLIDE)) | (((int)v & 1) ? SF_ACCENT : 0) | (((int)v & 2) ? SF_SLIDE : 0)); break;
+        case 4: s->vel = (uint8_t)v; break;
+        case 5: s->prob = (uint8_t)(v <= 100 ? v : COND_FIRST + (v - 101)); break;
+        default: s->flags = (uint8_t)((s->flags & ~SF_RATCH) | (((int)v - 1) << SF_RATCH_SH)); break;
         }
         break;
     case KR_TLV: XL.trk[k.id].p[P_LEVEL] = v; break;
@@ -227,6 +263,8 @@ static void fmt(const xl_pdesc *d, float v, char *b, int n)
     if (!strcmp(u, "note")) { int nn = (int)v; snprintf(b, (size_t)n, "%s%d", NOTE_N[nn % 12], nn / 12 - 2); return; }
     if (!strcmp(u, "slice")) { snprintf(b, (size_t)n, "%d", (int)v - 35); return; }
     if (!strcmp(u, "x")) { snprintf(b, (size_t)n, "%dx", (int)v); return; }
+    if (!strcmp(u, "chance")) { if (v <= 100) snprintf(b, (size_t)n, "%.0f%%", v); else snprintf(b, (size_t)n, "%s", COND_N[(int)v - 101 < NCOND ? (int)v - 101 : 0]); return; }
+    if (!strcmp(u, "steps")) { snprintf(b, (size_t)n, "%d step%s", (int)v, v > 1.5f ? "s" : ""); return; }
     if (!strcmp(u, "bars")) { snprintf(b, (size_t)n, "%d bar%s", (int)v, v > 1.5f ? "s" : ""); return; }
     if (!strcmp(d->name, "PAN")) { if (fabsf(v) < 0.02f) snprintf(b, (size_t)n, "C"); else snprintf(b, (size_t)n, "%s %.0f", v < 0 ? "L" : "R", fabsf(v) * 100); return; }
     if (!strcmp(d->name, "DJ FILTER")) { if (fabsf(v) < 0.02f) snprintf(b, (size_t)n, "OFF"); else snprintf(b, (size_t)n, "%s %.0f%%", v < 0 ? "LP" : "HP", fabsf(v) * 100); return; }
@@ -251,8 +289,13 @@ static void kref_page(int page, kref *k)
         break;
     case PG_MIX: for (i = 0; i < 8; i++) k[i] = (kref){KR_TLV, i}; break;
     case PG_SEQ:
-        k[0] = (kref){KR_TP, P_SLEN}; k[1] = (kref){KR_TP, P_SDIV}; k[2] = (kref){KR_G, G_SWING}; k[3] = (kref){KR_STEP, 0};
-        k[4] = (kref){KR_STEP, 1}; k[5] = (kref){KR_STEP, 2}; k[6] = (kref){KR_STEP, 3}; k[7] = (kref){KR_STEP, 4};
+        if (U.seqtrack) {
+            k[0] = (kref){KR_TP, P_SLEN}; k[1] = (kref){KR_TP, P_SDIV}; k[2] = (kref){KR_G, G_SWING}; k[3] = (kref){KR_TP, P_GATE};
+            k[4] = (kref){KR_G, G_BPM};
+        } else {
+            for (i = 0; i < 7; i++) k[i] = (kref){KR_STEP, i};
+            k[7] = (kref){KR_TP, P_GATE};
+        }
         break;
     case PG_SCENES:
         k[0] = (kref){KR_G, G_QUANT}; k[1] = (kref){KR_G, G_MORPHBARS}; k[2] = (kref){KR_G, G_SCENEA}; k[3] = (kref){KR_G, G_SCENEB};
@@ -318,8 +361,9 @@ static void mutate(void)
     if (fabsf(frand()) < a) t->p[P_DJ] = xl_pval(&XL_P[P_DJ], t->p[P_DJ] + frand() * a * 0.4f);
     for (i = 0; i < (int)t->p[P_SLEN]; i++) {
         xl_step *s = &t->st[i];
-        if (s->on && is_shard() && fabsf(frand()) < a * 0.5f) s->note = (uint8_t)(36 + rand() % (nslices() > 0 ? nslices() : 1));
-        if (fabsf(frand()) < a * 0.12f) { s->on = !s->on; if (s->on && is_shard()) s->note = (uint8_t)(36 + rand() % nslices()); }
+        if (step_on(s) && is_shard() && fabsf(frand()) < a * 0.5f) s->note[0] = (uint8_t)(36 + rand() % (nslices() > 0 ? nslices() : 1));
+        if (s->time != ST_TIE && fabsf(frand()) < a * 0.12f) { if (step_on(s)) s->n = 0; else note1(s, default_note(t, i)); }
+        if (step_on(s) && fabsf(frand()) < a * 0.1f) s->flags ^= SF_ACCENT;
     }
     msg("Mutated track %d by %.0f%%  (Cmd+Z undoes it)", sel() + 1, a * 100);
 }
@@ -588,6 +632,11 @@ static void draw_knobs(const char *hint)
         knob_ring(x + 40, cy + 2, knorm(d, v), PAGE_K[i].kind == KR_BAND && PAGE_K[i].id == P_LV0 ? C_R : (PAGE_K[i].kind == KR_TLV && PAGE_K[i].id != sel() ? C_T : C_R));
         d_text(x + 70, cy - 6, F11, C_D, d->name, 0);
         fmt(d, v, b, sizeof b);
+        if (PAGE_K[i].kind == KR_STEP && PAGE_K[i].id == 1) {
+            const xl_step *st = &ST()->st[cur()];
+            if (!step_on(st)) snprintf(b, sizeof b, "--");
+            else if (st->n > 1) snprintf(b + strlen(b), sizeof b - strlen(b), " +%d", st->n - 1);
+        }
         d_text_fit(x + 70, cy + 16, F15, C_T, b, 86);
         reg(x, KY + 28, 160, 80, R_KNOB, i, 0);
     }
@@ -968,162 +1017,240 @@ static void page_mix(void)
 }
 
 /* ---- SEQ ---- */
-static const char *const SB_L[] = {"EUCLID -", "EUCLID +", "SHIFT ←", "SHIFT →", "RANDOM", "CLEAR"};
+static const char *const SB_L[] = {"NOTE", "TIE", "REST", "ACCENT", "SLIDE", "CLEAR STEP", "EUCLID -", "EUCLID +", "SHIFT ←",
+                                   "SHIFT →", "RANDOM", "CLEAR ALL"};
 static void euclid(xl_track *t, int k)
 {
     int n = (int)t->p[P_SLEN], i, on = 0;
-    for (i = 0; i < n; i++) on += t->st[i].on;
+    for (i = 0; i < n; i++) on += step_on(&t->st[i]);
     k = on + k;
     if (k < 0) k = 0;
     if (k > n) k = n;
     undo_push();
     for (i = 0; i < n; i++) {
-        int was = t->st[i].on;
-        t->st[i].on = (uint8_t)(((i * k) % n) < k);
-        if (t->st[i].on && !was) t->st[i].note = (uint8_t)((int)t->p[P_ENGINE] == ENG_SHARD ? 36 + i % (t->smp ? t->smp->nsl : 1) : 60);
+        int want = ((i * k) % n) < k;
+        if (want && !step_on(&t->st[i])) note1(&t->st[i], default_note(t, i));
+        else if (!want) { t->st[i].n = 0; t->st[i].time = ST_NOTE; }
     }
     msg("%d of %d steps, spread evenly", k, n);
 }
-/* what a step plays, as a cell shows it: the slice number, or the note's name */
+/* what a step plays, as the screen shows it: the slice number or the note's name; a chord adds +n */
 static void step_label(const xl_track *t, const xl_step *st, char *b, int n)
 {
-    if ((int)t->p[P_ENGINE] == ENG_SHARD) snprintf(b, (size_t)n, "%d", st->note - 35);
-    else snprintf(b, (size_t)n, "%s", NOTE_N[st->note % 12]);
+    if ((int)t->p[P_ENGINE] == ENG_SHARD) snprintf(b, (size_t)n, "%d", st->note[0] - 35);
+    else snprintf(b, (size_t)n, "%s%d", NOTE_N[st->note[0] % 12], st->note[0] / 12 - 2);
+    if (st->n > 1) snprintf(b + strlen(b), (size_t)n - strlen(b), "+%d", st->n - 1);
 }
-/* the pitch lane's range: the slices, or the notes in use (at least an octave) */
-static void seq_range(const xl_track *t, int *lo, int *hi)
+/* the roll's range: the slices, or the notes in use on the page (at least an octave) */
+static void seq_range(const xl_track *t, int p0, int *lo, int *hi)
 {
-    int s, len = (int)t->p[P_SLEN];
+    int s, j, len = (int)t->p[P_SLEN];
     if ((int)t->p[P_ENGINE] == ENG_SHARD) {
         int n = t->smp && t->smp->nsl > 0 ? t->smp->nsl : 1;
         *lo = 36; *hi = 36 + (n > 1 ? n - 1 : 1);
         return;
     }
     *lo = 127; *hi = 0;
-    for (s = 0; s < len; s++) if (t->st[s].on) { if (t->st[s].note < *lo) *lo = t->st[s].note; if (t->st[s].note > *hi) *hi = t->st[s].note; }
+    for (s = p0; s < p0 + 16 && s < len; s++)
+        if (step_on(&t->st[s])) for (j = 0; j < t->st[s].n; j++) { if (t->st[s].note[j] < *lo) *lo = t->st[s].note[j]; if (t->st[s].note[j] > *hi) *hi = t->st[s].note[j]; }
     if (*lo > *hi) { *lo = 54; *hi = 66; }
-    *lo -= 3; *hi += 3;
-    while (*hi - *lo < 12) { (*lo)--; (*hi)++; }
+    *lo -= 2; *hi += 2;
+    while (*hi - *lo < 14) { (*lo)--; (*hi)++; }
     if (*lo < 0) *lo = 0;
     if (*hi > 127) *hi = 127;
 }
-static float seq_y(int v, int lo, int hi, float py, float ph) { return py + 10 + (float)(hi - v) / (hi - lo) * (ph - 20); }
-static int seq_v(float y, int lo, int hi, float py, float ph)
+#define SQ_X0 182
+#define SQ_CW 64
+#define SQ_RY 142                       /* the track rows */
+#define SQ_RH 29
+#define SQ_PY (SQ_RY + 8 * SQ_RH + 8)   /* the roll */
+#define SQ_PH 172
+static float sq_x(int i) { return SQ_X0 + i * SQ_CW + (i / 4) * 8; }
+static float seq_y(int v, int lo, int hi) { return SQ_PY + 12 + (float)(hi - v) / (hi - lo) * (SQ_PH - 24); }
+static int seq_v(float y, int lo, int hi)
 {
-    int v = hi - (int)floorf((y - py - 10) / (ph - 20) * (hi - lo) + 0.5f);
+    int v = hi - (int)floorf((y - SQ_PY - 12) / (SQ_PH - 24) * (hi - lo) + 0.5f);
     return v < lo ? lo : v > hi ? hi : v;
 }
-#define SEQ_PY (CY0 + 34 + 8 * 34 + 8)
-#define SEQ_PH 112
-static void seq_pitch(float y, int first, int mods)
+static int seq_page(int t)   /* the page a track's row shows: where it plays, or the cursor's (as SHARD's) */
 {
-    xl_track *t = ST();
-    xl_step *st = &t->st[U.step];
-    int v;
-    if (first) {
-        undo_push();
-        seq_range(t, &U.plo, &U.phi);
-        U.pnote = -1;
-        if (mods & MOD_ALT) { st->on = 0; return; }
-    } else if (!st->on) return;
-    v = seq_v(y, U.plo, U.phi, SEQ_PY, SEQ_PH);
-    if (!st->on) { st->on = 1; if (st->prob == 0) st->prob = 100; if (st->vel == 0) st->vel = 100; }
-    st->note = (uint8_t)v;
-    if (v != U.pnote) {   /* hear it */
-        if (U.pnote >= 0) cmd(CMD_NOTE_OFF, sel(), U.pnote, 0, 0);
-        cmd(CMD_NOTE_ON, sel(), v, st->vel, 0);
-        U.pnote = v;
+    int len = (int)XL.trk[t].p[P_SLEN], np = (len + 15) / 16, pg;
+    if (atomic_load(&XL.playing)) pg = XL.v.step[t] / 16;
+    else pg = t == sel() ? cur() / 16 : 0;
+    return pg >= np ? np - 1 : pg;
+}
+static void seq_track_row(int t)
+{
+    xl_track *tk = &XL.trk[t];
+    float y = SQ_RY + t * SQ_RH;
+    int len = (int)tk->p[P_SLEN], pg = seq_page(t), p0 = pg * 16, np = (len + 15) / 16, i, s = t == sel(), carry = 0;
+    int pl = atomic_load(&XL.playing), ph = pl && XL.v.step[t] / 16 == pg ? XL.v.step[t] % 16 : -1;
+    uint32_t cn = s ? C_R : C_T;
+    char b[64];
+    if (s) d_rect(14, y - 1, 1252, SQ_RH - 2, C_RT, 6);
+    snprintf(b, sizeof b, "%d", t + 1);
+    d_text(22, y + 18, F15, s ? C_R : C_T, b, 0);
+    d_text_fit(40, y + 18, F13, C_D, tk->smp ? tk->smp->name : "empty", 112);
+    reg(14, y - 1, 160, SQ_RH - 2, R_SLANE, t, 0);
+    for (i = p0 - 1; i >= 0; i--) if (tk->st[i].time != ST_TIE) { carry = step_on(&tk->st[i]); break; }   /* a TIE carried in */
+    for (i = 0; i < 16 && p0 + i < len; i++) {
+        const xl_step *st = &tk->st[p0 + i];
+        float x = sq_x(i), bw = SQ_CW - 6, by = y + SQ_RH - 6;
+        if (i == ph) d_rect(x - 2, y, bw + 4, SQ_RH - 4, s ? 0xFF4A1A16u : C_P2, 4);
+        if (st->time == ST_TIE && carry) {             /* held on: joined to the bar before */
+            float x0 = i ? sq_x(i - 1) + bw - 2 : x - 4;
+            d_rect(x0, by - 6, x + 4 - x0, 6, cn, 0);
+            d_rect(x, by - 6, bw, 6, cn, 2);
+        } else if (step_on(st)) {                      /* a note: a bar, an accent taller; what it plays above */
+            int acc = (st->flags & SF_ACCENT) != 0, r = step_ratchet(st);
+            float h = acc ? 12 : 6;
+            d_rect(x, by - h, bw, h, cn, 2);
+            step_label(tk, st, b, sizeof b);
+            d_text(x + 2, by - h - 4, F11, s ? C_T : C_D, b, 0);
+            if (st->flags & SF_SLIDE) d_line(x + bw - 10, by - h - 6, x + bw - 2, by - h - 12, cn, 1.5f);
+            if (r > 1) { int k; for (k = 0; k < r; k++) d_rect(x + bw - 4 - k * 5, y + 3, 3, 4, cn, 0); }
+            if (st->prob < 100) {
+                if (st->prob >= COND_FIRST) d_text(x + bw - 2 - (r > 1 ? 22 : 0), y + 10, F9, C_D2, COND_N[st->prob - COND_FIRST], 2);
+                else { snprintf(b, sizeof b, "%d%%", st->prob); d_text(x + bw - 2 - (r > 1 ? 22 : 0), y + 10, F9, C_D2, b, 2); }
+            }
+            carry = 1;
+            if (t == sel() && p0 + i == cur()) d_frame(x - 3, y, bw + 6, SQ_RH - 4, C_R, 1.5f, 4);
+            reg(x - 3, y, SQ_CW, SQ_RH - 2, R_SLANE + 100, t, p0 + i);
+            continue;
+        } else {                                       /* empty, a REST, a TIE carrying nothing: a stub */
+            d_rect(x, by - 2, bw, 2, st->time == ST_REST ? C_W : st->time == ST_TIE ? C_D2 : C_L, 0);
+        }
+        carry = st->time == ST_TIE && carry;
+        if (t == sel() && p0 + i == cur()) d_frame(x - 3, y, bw + 6, SQ_RH - 4, C_R, 1.5f, 4);
+        reg(x - 3, y, SQ_CW, SQ_RH - 2, R_SLANE + 100, t, p0 + i);
+    }
+    if (np > 1) for (i = 0; i < np; i++) d_rect(1252, y + 5 + i * 5, 6, 3, i == pg ? cn : C_L, 1);   /* the pages */
+}
+static void seq_roll(void)
+{
+    xl_track *tk = ST();
+    int len = (int)tk->p[P_SLEN], p0 = cur() / 16 * 16, lo, hi, v, i, j, shard = (int)tk->p[P_ENGINE] == ENG_SHARD;
+    int pl = atomic_load(&XL.playing), ph = pl && XL.v.step[sel()] / 16 == p0 / 16 ? XL.v.step[sel()] % 16 : -1;
+    char b[64];
+    seq_range(tk, p0, &lo, &hi);
+    d_text(22, SQ_PY + 18, F15, C_T, shard ? "Slices" : "Notes", 0);
+    d_text(22, SQ_PY + 38, F11, C_D, "click: set · drag: move", 0);
+    d_text(22, SQ_PY + 54, F11, C_D, "Shift-click: chord", 0);
+    d_text(22, SQ_PY + 70, F11, C_D, "Alt-click: clear", 0);
+    d_rect(SQ_X0 - 6, SQ_PY, 1068, SQ_PH, C_P, 6);
+    {
+        int every = (int)ceilf(13.0f / ((SQ_PH - 24) / (float)(hi - lo)));
+        if (every < 1) every = 1;
+        for (v = lo; v <= hi; v++) {   /* a guide per slice, or each C (and E, G) */
+            float yc = seq_y(v, lo, hi);
+            int show = shard ? (v - lo) % every == 0 : v % 12 == 0;
+            if (shard || v % 12 == 0 || v % 12 == 4 || v % 12 == 7) d_rect(SQ_X0 - 6, yc, 1068, 1, v % 12 == 0 && !shard ? C_L : C_P2, 0);
+            if (show) {
+                if (shard) snprintf(b, sizeof b, "%d", v - 35); else snprintf(b, sizeof b, "C%d", v / 12 - 2);
+                d_text(1240, yc + 4, F11, C_D2, b, 0);
+            }
+        }
+    }
+    for (i = 0; i < 16 && p0 + i < len; i++) {
+        const xl_step *st = &tk->st[p0 + i];
+        float x = sq_x(i), bw = SQ_CW - 6;
+        if (p0 + i == cur()) d_rect(x - 3, SQ_PY + 2, bw + 6, SQ_PH - 4, 0x30FF3B30u, 3);
+        if (i == ph) d_rect(x - 3, SQ_PY + 2, bw + 6, 3, C_T, 1);
+        if (step_on(st)) {
+            int L = note_len(tk, p0 + i), acc = (st->flags & SF_ACCENT) != 0;
+            float w = L > 1 ? sq_x(i + L - 1 < 16 ? i + L - 1 : 15) + bw - x : bw;
+            for (j = 0; j < st->n; j++) {
+                int nv = st->note[j] < lo ? lo : st->note[j] > hi ? hi : st->note[j];
+                float yc = seq_y(nv, lo, hi), h = acc ? 14 : 10;
+                d_rect(x, yc - h / 2, w, h, acc ? C_R : C_T, 3);
+                if (!j) { step_label(tk, st, b, sizeof b); d_text(x + 3, yc - h / 2 - 3, F11, C_D, b, 0); }
+            }
+            if ((st->flags & SF_SLIDE) && i + L < 16 && p0 + i + L < len && step_on(&tk->st[p0 + i + L])) {   /* to the next note */
+                float y0 = seq_y(st->note[0] < lo ? lo : st->note[0] > hi ? hi : st->note[0], lo, hi);
+                const xl_step *nx = &tk->st[p0 + i + L];
+                float y1 = seq_y(nx->note[0] < lo ? lo : nx->note[0] > hi ? hi : nx->note[0], lo, hi);
+                d_line(x + w, y0, sq_x(i + L), y1, C_T, 2);
+            }
+        }
+        reg(x - 3, SQ_PY, SQ_CW, SQ_PH, R_SPITCH, p0 + i, 0);
     }
 }
 static void page_seq(void)
 {
-    int t, s;
+    xl_track *tk = ST();
+    int len = (int)tk->p[P_SLEN], np = (len + 15) / 16, pg = cur() / 16, i, t;
     char b[200];
-    float y0 = CY0 + 34;
-    double beat = XL.v.beat;
-    int pl = atomic_load(&XL.playing);
-    for (s = 0; s < 4; s++) { snprintf(b, sizeof b, "%d", s * 16 + 1); d_text(158 + s * (16 * 16 + 6), y0 - 8, F11, C_D2, b, 0); }
-    for (t = 0; t < XL_NTRK; t++) {
-        xl_track *tk = &XL.trk[t];
-        float y = y0 + t * 34;
-        int len = (int)tk->p[P_SLEN], cur = XL.v.step[t];
-        if (t == sel()) d_rect(14, y - 2, 1252, 32, C_RT, 6);
-        snprintf(b, sizeof b, "%d", t + 1);
-        d_text(22, y + 20, F15, t == sel() ? C_R : C_T, b, 0);
-        d_text_fit(40, y + 20, F13, C_D, tk->smp ? tk->smp->name : "empty", 104);
-        reg(14, y - 2, 138, 32, R_SLANE, t, 0);
-        for (s = 0; s < XL_NSTEP; s++) {
-            float x = 158 + s * 16 + (s / 16) * 6;
-            xl_step *st = &tk->st[s];
-            uint32_t c;
-            if (s >= len) c = 0xFF0A0A0Au;
-            else if (st->on) c = t == sel() ? C_R : C_T;
-            else c = (s / 4) % 2 ? C_P : C_P2;
-            d_rect(x, y + 2, 14, 24, c, 3);
-            if (s < len && st->on) {   /* what it plays, and its marks */
-                step_label(tk, st, b, sizeof b);
-                d_text(x + 7, y + 18, strlen(b) > 1 ? F9 : F11, C_BG, b, 1);
-                if (st->prob < 100) d_rect(x + 3, y + 4, 8, 2, C_BG, 1);
-                if (st->ratchet > 1) { int r; for (r = 0; r < st->ratchet; r++) d_rect(x + 2 + r * 3, y + 22, 2, 3, C_BG, 0); }
-                if (st->cond > 1) d_circle(x + 11.5f, y + 6, 1.8f, C_BG);
-            }
-            if (pl && s == cur) d_frame(x, y + 2, 14, 24, C_T, 2, 3);
-            if (t == sel() && s == U.step) d_frame(x - 1, y + 1, 16, 26, C_R, 1, 3);
-            if (s < len) reg(x, y + 2, 15, 24, R_SLANE + 100, t, s);
+    float x;
+    snprintf(b, sizeof b, "Track %d · %s · %d steps · %s", sel() + 1, (int)tk->p[P_ENGINE] == ENG_SHARD ? "SHARD" : "SAMPLE", len,
+             XL_P[P_SDIV].labels[(int)tk->p[P_SDIV]]);
+    d_text(20, CY0 + 28, F18, C_T, b, 0);
+    x = 640;
+    d_text(x, CY0 + 26, F11, C_D, "PAGE", 0);
+    for (i = 0; i < 4; i++) {
+        float bx = x + 40 + i * 40;
+        int on = i == pg, ok = i < np;
+        snprintf(b, sizeof b, "%d", i + 1);
+        d_rect(bx, CY0 + 8, 34, 28, on ? C_R : C_P2, 5);
+        d_text(bx + 17, CY0 + 27, F13, on ? C_BG : ok ? C_T : C_W, b, 1);
+        if (ok) reg(bx, CY0 + 8, 34, 28, R_SBTN + 100, i, 0);
+    }
+    button(850, CY0 + 8, 124, 28, U.seqtrack ? "KNOBS: TRACK" : "KNOBS: STEP", 0, R_SBTN + 101, 0, 0);
+    button(982, CY0 + 8, 70, 28, "FILL", atomic_load(&XL.fill_held), R_SBTN + 102, 0, 0);
+    if (atomic_load(&XL.rec) && !atomic_load(&XL.playing)) {
+        snprintf(b, sizeof b, "STEP ENTRY: play into step %d", cur() + 1);
+        d_text(1260, CY0 + 28, F13, C_R, b, 2);
+    }
+    for (t = 0; t < XL_NTRK; t++) seq_track_row(t);
+    seq_roll();
+    {
+        float bx = SQ_X0 - 6, by = SQ_PY + SQ_PH + 8;
+        const xl_step *st = &tk->st[cur()];
+        for (i = 0; i < 12; i++) {
+            float w = d_textw(F11, SB_L[i]) + 20;
+            int on = (i == 0 && st->time == ST_NOTE && step_on(st)) || (i == 1 && st->time == ST_TIE) || (i == 2 && st->time == ST_REST) ||
+                     (i == 3 && (st->flags & SF_ACCENT)) || (i == 4 && (st->flags & SF_SLIDE));
+            d_rect(bx, by, w, 26, on ? C_R : C_P2, 5);
+            if (!on) d_frame(bx, by, w, 26, C_L, 1, 5);
+            d_text(bx + w / 2, by + 18, F11, on ? C_BG : C_T, SB_L[i], 1);
+            reg(bx, by, w, 26, R_SBTN, i, 0);
+            bx += w + (i == 2 || i == 4 || i == 5 ? 16 : 6);
         }
     }
-    {   /* the selected track: what each step plays (drag it up or down), and its velocity */
-        xl_track *tk = ST();
-        float py = y0 + 8 * 34 + 8, ph = 112, vy = py + ph + 6, vh = 34;
-        int len = (int)tk->p[P_SLEN], shard = (int)tk->p[P_ENGINE] == ENG_SHARD, lo, hi, v;
-        seq_range(tk, &lo, &hi);
-        snprintf(b, sizeof b, "Track %d", sel() + 1);
-        d_text(22, py + 18, F15, C_T, b, 0);
-        d_text(22, py + 38, F11, C_D, shard ? "slice per step" : "note per step", 0);
-        d_text(22, py + 54, F11, C_D2, "drag up or down", 0);
-        d_text(22, py + 68, F11, C_D2, "Alt-click clears", 0);
-        d_text(22, vy + 22, F11, C_D, "velocity", 0);
-        d_rect(156, py, 1048, ph, C_P, 6);
-        {
-            int every = (int)ceilf(13.0f / ((ph - 20) / (float)(hi - lo)));   /* labels at least 13 px apart */
-            if (every < 1) every = 1;
-            for (v = lo; v <= hi; v++) {   /* a guide per slice, or per C */
-            float yc = seq_y(v, lo, hi, py, ph);
-            if (shard ? (v - lo) % every == 0 : v % 12 == 0) {
-                d_rect(156, yc, 1048, 1, C_P2, 0);
-                if (shard) snprintf(b, sizeof b, "%d", v - 35); else snprintf(b, sizeof b, "C%d", v / 12 - 2);
-                d_text(1210, yc + 4, F11, C_D2, b, 0);
-            }
-            }
-        }
-        for (s = 0; s < len; s++) {
-            float x = 158 + s * 16 + (s / 16) * 6;
-            xl_step *st = &tk->st[s];
-            if (st->on) {
-                float yc = seq_y(st->note < lo ? lo : st->note > hi ? hi : st->note, lo, hi, py, ph);
-                float vv = st->vel / 127.0f * vh;
-                d_rect(x, yc - 8, 14, 16, s == U.step ? C_R : C_T, 3);
-                step_label(tk, st, b, sizeof b);
-                d_text(x + 7, yc + 4, strlen(b) > 1 ? F9 : F11, C_BG, b, 1);
-                d_rect(x, vy + vh - vv, 14, vv, s == U.step ? C_R : C_D, 2);
-            } else d_rect(x + 6, vy + vh - 2, 2, 2, C_L, 0);
-            reg(x - 1, py, 16, ph, R_SPITCH, s, 0);
-            reg(x - 1, vy, 16, vh, R_SVEL, s, 0);
-        }
-        {
-            float x = 158, y = vy + vh + 6;
-            int i;
-            for (i = 0; i < 6; i++) {
-                float w = d_textw(F11, SB_L[i]) + 22;
-                button(x, y, w, 26, SB_L[i], 0, R_SBTN, i, 0);
-                x += w + 8;
-            }
-            d_text(x + 8, y + 18, F11, C_D2, "bar at the top of a step: chance below 100% · ticks: ratchets · dot: plays 1 in N passes", 0);
-        }
+    {
+        char hb[220];
+        if (U.seqtrack) snprintf(hb, sizeof hb, "Track %d: LENGTH, DIV, SWING, GATE and the tempo", sel() + 1);
+        else snprintf(hb, sizeof hb, "Step %d · arrows move the cursor, up / down transpose, Delete clears · REC while stopped: step entry", cur() + 1);
+        draw_knobs(hb);
     }
-    (void)beat;
-    snprintf(b, sizeof b, "Step %d of track %d · click a step to turn it on or off, Shift-click to select it · drag a step in the lane below to change what it plays", U.step + 1, sel() + 1);
-    draw_knobs(b);
+}
+/* the roll: click sets the note there (Shift: adds to the chord or takes it out, Alt: clears), drag moves it */
+static void seq_roll_mouse(float y, int first, int mods)
+{
+    xl_track *t = ST();
+    xl_step *st = &t->st[cur()];
+    int v, j;
+    if (first) {
+        undo_push();
+        seq_range(t, cur() / 16 * 16, &U.plo, &U.phi);
+        U.pnote = -1;
+        v = seq_v(y, U.plo, U.phi);
+        if (mods & MOD_ALT) { st->n = 0; U.grab = -1; return; }
+        U.grab = -1;
+        if (step_on(st)) for (j = 0; j < st->n; j++) if (abs(st->note[j] - v) <= ((U.phi - U.plo) > 30 ? 1 : 0)) U.grab = j;
+        if (mods & MOD_SHIFT) {
+            if (U.grab >= 0 && st->n > 1) { for (j = U.grab; j < st->n - 1; j++) st->note[j] = st->note[j + 1]; st->n--; U.grab = -1; return; }
+            if (U.grab < 0) { if (!step_on(st)) note1(st, v); else if (st->n < 4) st->note[st->n++] = (uint8_t)v; U.grab = st->n - 1; }
+        } else if (U.grab < 0) { note1(st, v); U.grab = 0; }
+    }
+    if (U.grab < 0 || !step_on(st) || U.grab >= st->n) return;
+    v = seq_v(y, U.plo, U.phi);
+    st->note[U.grab] = (uint8_t)v;
+    U.lastnote = st->note[0];
+    if (v != U.pnote) {   /* hear it (and only hear it: no step entry) */
+        if (U.pnote >= 0) cmd(CMD_NOTE_OFF, sel(), U.pnote, 0, (void *)1);
+        cmd(CMD_NOTE_ON, sel(), v, st->vel, (void *)1);
+        U.pnote = v;
+    }
 }
 
 /* ---- SCENES ---- */
@@ -1143,13 +1270,13 @@ static void page_scenes(void)
         if (!s->valid) d_text(x + 18, y + 80, F13, C_D2, "empty · click to store", 0);
         else {
             int t, act = 0;
-            for (t = 0; t < XL_NTRK; t++) { int k, on = 0; for (k = 0; k < XL_NSTEP; k++) on += s->st[t][k].on; act += on > 0 && s->p[t][P_MUTE] < 0.5f; }
+            for (t = 0; t < XL_NTRK; t++) { int k, on = 0; for (k = 0; k < XL_NSTEP; k++) on += step_on(&s->st[t][k]); act += on > 0 && s->p[t][P_MUTE] < 0.5f; }
             d_text(x + 18, y + 80, F13, C_D, playing ? (XL.v.morph_t >= 0 ? "morphing" : "playing") : queued ? "next bar" : "stored", 0);
             snprintf(b, sizeof b, "%d track%s playing", act, act == 1 ? "" : "s");
             d_text(x + 18, y + 100, F11, C_D2, b, 0);
             for (t = 0; t < XL_NTRK; t++) {   /* a little picture of each track's pattern */
                 int k;
-                for (k = 0; k < 16; k++) if (s->st[t][k].on) d_rect(x + 18 + k * 10.5f, y + 116 + t * 7, 8, 4, playing ? C_R : C_D, 1);
+                for (k = 0; k < 16; k++) if (step_on(&s->st[t][k])) d_rect(x + 18 + k * 10.5f, y + 116 + t * 7, 8, 4, playing ? C_R : C_D, 1);
                     else d_rect(x + 18 + k * 10.5f, y + 116 + t * 7, 8, 4, C_P2, 1);
             }
             if (playing && XL.v.morph_t >= 0) { d_rect(x + 18, y + h - 10, (w - 36) * XL.v.morph_t, 4, C_R, 2); }
@@ -1257,7 +1384,7 @@ static void page_setup(void)
             "Tab: next page              Cmd+1-7: pages",
             "Shift+1-8, held: kill that track's LOW band",
             "Alt+1-4, held: beat repeat 1/4, 1/8, 1/16, 1/32",
-            "Cmd+R: record   Cmd+K: capture   Cmd+M: mutate",
+            "Cmd+R: record (stopped: step entry)   Cmd+K: capture   Cmd+M: mutate",
             "Cmd+Z / Cmd+Shift+Z: undo / redo   Cmd+S: save",
             "?: all of this, any time"};
         for (i = 0; i < 8; i++) d_text(x2, y0 + 40 + i * 22, F13, C_T, KL[i], 0);
@@ -1276,7 +1403,7 @@ static void draw_help(void)
     static const char *const H[] = {
         "Space  play / stop", "1-8  select a track", "Tab, Cmd+1-7  pages", "A W S E D F T G Y H U J K  play notes (Z X octave)",
         "Shift+1-8 held  kill a track's LOW band", "Alt+1-4 held  beat repeat 1/4 · 1/8 · 1/16 · 1/32",
-        "Cmd+R  record into the pattern", "Cmd+K  capture the last 60 s to a file", "Cmd+M  mutate the selected track",
+        "Cmd+R  REC: playing, notes land on the steps; stopped, step entry", "SEQ: arrows move the step, up / down transpose, Delete clears, ` held: FILL", "Cmd+K  capture the last 60 s to a file", "Cmd+M  mutate the selected track",
         "Cmd+Z, Cmd+Shift+Z  undo, redo", "Cmd+S  save (also every minute, and on quit)",
         "Drop sound files on the window, or on a track button", "Knobs: drag up and down, scroll, double-click resets",
         "Esc or click: close this"};
@@ -1284,7 +1411,7 @@ static void draw_help(void)
     d_rect(0, 0, 1280, 720, 0xCC000000u, 0);
     d_rect(300, 90, 680, 540, C_P, 12); d_frame(300, 90, 680, 540, C_L, 1, 12);
     d_text(330, 130, F24, C_T, "SHARD XL · keys and moves", 0);
-    for (i = 0; i < 14; i++) d_text(330, 172 + i * 31, F15, i == 13 ? C_D : C_T, H[i], 0);
+    for (i = 0; i < 15; i++) d_text(330, 168 + i * 29, F15, i == 14 ? C_D : C_T, H[i], 0);
     reg(0, 0, 1280, 720, R_HELP, 0, 0);
 }
 
@@ -1356,7 +1483,7 @@ static void wave_down(float x, float y, int mods, int clicks)
             return;
         }
         for (i = 0; i < s->nsl; i++) if (f >= s->sl[i] && f < s->sl[i + 1]) U.slice = i;
-        cmd(CMD_NOTE_ON, sel(), (int)ST()->p[P_ENGINE] == ENG_SHARD ? 36 + U.slice : 60, 110, 0);
+        cmd(CMD_NOTE_ON, sel(), (int)ST()->p[P_ENGINE] == ENG_SHARD ? 36 + U.slice : 60, 110, (void *)1);
         U.db = 1;
     }
 }
@@ -1396,7 +1523,7 @@ void xl_ui_mouse(int type, float x, float y, int mods, int clicks)
         if (!r) return;
         U.da = r->a; U.db = r->b;
         switch (r->type) {
-        case R_TRK: atomic_store(&XL.sel_track, r->a); U.step = U.step; break;
+        case R_TRK: atomic_store(&XL.sel_track, r->a); break;
         case R_TAB: U.page = r->a; if (U.page == PG_FILES && !U.dir[0]) { char p[1100]; snprintf(p, sizeof p, "%s/Samples", XL.home); files_open(p); } break;
         case R_PLAY: play_toggle(); break;
         case R_BPM: U.dv0 = XL.g[G_BPM]; undo_push(); break;
@@ -1424,7 +1551,7 @@ void xl_ui_mouse(int type, float x, float y, int mods, int clicks)
         }
         case R_WOV: if (ST()->smp) { U.view0 = (x - 20) / 1240 - 0.5f / U.zoom; if (U.view0 < 0) U.view0 = 0; if (U.view0 > 1 - 1 / U.zoom) U.view0 = 1 - 1 / U.zoom; } break;
         case R_WMAIN: U.db = 0; wave_down(x, y, mods, clicks); break;
-        case R_CHIP: U.slice = r->a; cmd(CMD_NOTE_ON, sel(), 36 + r->a, 110, 0); U.db = 1; break;
+        case R_CHIP: U.slice = r->a; cmd(CMD_NOTE_ON, sel(), 36 + r->a, 110, (void *)1); U.db = 1; break;
         case R_WBTN: {
             xl_sample *s = ST()->smp;
             if (!s) break;
@@ -1459,49 +1586,53 @@ void xl_ui_mouse(int type, float x, float y, int mods, int clicks)
         case R_MSOLO: XL.trk[r->a].p[P_SOLO] = XL.trk[r->a].p[P_SOLO] >= 0.5f ? 0.0f : 1.0f; break;
         case R_XCURVE: XL.g[G_XCURVE] = (float)r->a; break;
         case R_SLANE: atomic_store(&XL.sel_track, r->a); break;
-        case R_SLANE + 100: {
+        case R_SLANE + 100: {   /* a step of a track row: on or off (Shift: only the cursor); drag paints */
             xl_track *t = &XL.trk[r->a];
             xl_step *s = &t->st[r->b];
             atomic_store(&XL.sel_track, r->a);
-            U.step = r->b;
+            cursor_set(r->b);
             if (!(mods & MOD_SHIFT)) {
                 undo_push();
-                s->on = !s->on;
-                if (s->on) {
-                    if ((int)t->p[P_ENGINE] == ENG_SHARD && (s->note < 36 || s->note >= 36 + (t->smp ? t->smp->nsl : 1)))
-                        s->note = (uint8_t)(36 + r->b % (t->smp && t->smp->nsl > 0 ? t->smp->nsl : 1));
-                    if (s->prob == 0) s->prob = 100;
-                }
+                if (step_on(s)) { s->n = 0; s->time = ST_NOTE; }
+                else note1(s, default_note(t, r->b));
             }
-            U.db = s->on;   /* drag across: paint the same */
+            U.db = step_on(s);
             break;
         }
-        case R_SVEL: U.step = r->a; undo_push(); xl_ui_mouse(MS_DRAG, x, y, mods, 0); break;
-        case R_SPITCH: U.step = r->a; seq_pitch(y, 1, mods); break;
+        case R_SPITCH: cursor_set(r->a); seq_roll_mouse(y, 1, mods); break;
+        case R_SBTN + 100: cursor_set(r->a * 16 + cur() % 16); break;
+        case R_SBTN + 101: U.seqtrack = !U.seqtrack; break;
+        case R_SBTN + 102: atomic_store(&XL.fill_held, 1); break;
         case R_SBTN: {
             xl_track *t = ST();
+            xl_step *st = &t->st[cur()];
             int n = (int)t->p[P_SLEN], i;
+            undo_push();
             switch (r->a) {
-            case 0: euclid(t, -1); break;
-            case 1: euclid(t, 1); break;
-            case 2: case 3: {
+            case 0: st->time = ST_NOTE; if (!st->n) note1(st, default_note(t, cur())); break;
+            case 1: st->time = ST_TIE; break;
+            case 2: st->time = ST_REST; break;
+            case 3: if (step_on(st)) st->flags ^= SF_ACCENT; break;
+            case 4: if (step_on(st)) st->flags ^= SF_SLIDE; break;
+            case 5: st->n = 0; st->time = ST_NOTE; st->flags = 0; st->prob = 100; cursor_set(cur() + 1); break;
+            case 6: euclid(t, -1); break;
+            case 7: euclid(t, 1); break;
+            case 8: case 9: {
                 xl_step tmp[XL_NSTEP];
-                undo_push();
                 memcpy(tmp, t->st, sizeof tmp);
-                for (i = 0; i < n; i++) t->st[i] = tmp[(i + (r->a == 2 ? 1 : n - 1)) % n];
+                for (i = 0; i < n; i++) t->st[i] = tmp[(i + (r->a == 8 ? 1 : n - 1)) % n];
                 break;
             }
-            case 4: {
-                int ns = t->smp ? t->smp->nsl : 1;
-                undo_push();
+            case 10:
                 for (i = 0; i < n; i++) {
-                    t->st[i].on = (uint8_t)(rand() % 100 < 35);
-                    t->st[i].note = (uint8_t)((int)t->p[P_ENGINE] == ENG_SHARD ? 36 + rand() % (ns > 0 ? ns : 1) : 60);
-                    t->st[i].vel = (uint8_t)(70 + rand() % 57);
+                    xl_step *q = &t->st[i];
+                    q->time = ST_NOTE; q->flags = 0; q->prob = 100;
+                    if (rand() % 100 < 35) { note1(q, default_note(t, rand() % 64)); q->vel = (uint8_t)(70 + rand() % 57);
+                                             if (rand() % 6 == 0) q->flags |= SF_ACCENT; }
+                    else q->n = 0;
                 }
                 break;
-            }
-            case 5: undo_push(); for (i = 0; i < XL_NSTEP; i++) t->st[i].on = 0; break;
+            case 11: for (i = 0; i < XL_NSTEP; i++) { t->st[i].n = 0; t->st[i].time = ST_NOTE; t->st[i].flags = 0; } break;
             }
             break;
         }
@@ -1574,31 +1705,22 @@ void xl_ui_mouse(int type, float x, float y, int mods, int clicks)
             region *r = hit(x, y);
             if (r && r->type == R_SLANE + 100 && r->a == U.da) {
                 xl_track *t = &XL.trk[r->a];
-                if (t->st[r->b].on != U.db) {
-                    t->st[r->b].on = (uint8_t)U.db;
-                    if (U.db && (int)t->p[P_ENGINE] == ENG_SHARD) t->st[r->b].note = (uint8_t)(36 + r->b % (t->smp && t->smp->nsl > 0 ? t->smp->nsl : 1));
-                }
+                xl_step *q = &t->st[r->b];
+                if (step_on(q) != U.db && q->time != ST_TIE) { if (U.db) note1(q, default_note(t, r->b)); else q->n = 0; }
             }
             break;
         }
-        case R_SVEL: {
-            region *r = hit(x, y);
-            float vy = SEQ_PY + SEQ_PH + 6, h = 34, v;
-            if (r && r->type == R_SVEL) U.step = r->a;
-            v = (vy + h - y) / h * 127;
-            ST()->st[U.step].vel = (uint8_t)(v < 1 ? 1 : v > 127 ? 127 : v);
-            break;
-        }
-        case R_SPITCH: seq_pitch(y, 0, mods); break;
+        case R_SPITCH: seq_roll_mouse(y, 0, mods); break;
         case R_FSCROLL: break;
         }
         (void)ddy;
         return;
     }
     if (type == MS_UP) {
-        if (U.dtype == R_SPITCH && U.pnote >= 0) { cmd(CMD_NOTE_OFF, sel(), U.pnote, 0, 0); U.pnote = -1; }
+        if (U.dtype == R_SPITCH && U.pnote >= 0) { cmd(CMD_NOTE_OFF, sel(), U.pnote, 0, (void *)1); U.pnote = -1; }
+        if (U.dtype == R_SBTN + 102) atomic_store(&XL.fill_held, 0);
         if (U.dtype == R_WMAIN || U.dtype == R_CHIP) {
-            if (U.db == 1) cmd(CMD_NOTE_OFF, sel(), (int)ST()->p[P_ENGINE] == ENG_SHARD ? 36 + U.slice : 60, 0, 0);
+            if (U.db == 1) cmd(CMD_NOTE_OFF, sel(), (int)ST()->p[P_ENGINE] == ENG_SHARD ? 36 + U.slice : 60, 0, (void *)1);
         }
         if (U.dtype == R_SCENE) {
             int i = U.da;
@@ -1671,10 +1793,11 @@ void xl_ui_key(int down, int key, int mods)
         int base = (int)ST()->p[P_ENGINE] == ENG_SHARD ? 36 : 60, n = base + (int)(mk - MUSIC_KEYS) + U.octave * 12;
         if (n < 0) n = 0;
         if (n > 127) n = 127;
-        if (down && !U.keynote[key]) { U.keynote[key] = n + 1; cmd(CMD_NOTE_ON, sel(), n, 100, 0); }
+        if (down && !U.keynote[key]) { U.keynote[key] = n + 1; U.lastnote = n; cmd(CMD_NOTE_ON, sel(), n, 100, 0); }
         else if (!down && U.keynote[key]) { cmd(CMD_NOTE_OFF, sel(), U.keynote[key] - 1, 0, 0); U.keynote[key] = 0; }
         return;
     }
+    if (key == '`' && !down) { atomic_store(&XL.fill_held, 0); return; }
     if (!down) return;
     switch (key) {
     case K_SPACE: play_toggle(); break;
@@ -1683,10 +1806,18 @@ void xl_ui_key(int down, int key, int mods)
     case 'z': if (U.octave > -3) U.octave--; msg("Octave %+d", U.octave); break;
     case 'x': if (U.octave < 4) U.octave++; msg("Octave %+d", U.octave); break;
     case '?': case '/': U.help = !U.help; break;
-    case K_LEFT: if (U.page == PG_SEQ) { if (U.step > 0) U.step--; } else if (U.slice > 0) U.slice--; break;
-    case K_RIGHT: if (U.page == PG_SEQ) { if (U.step < (int)ST()->p[P_SLEN] - 1) U.step++; } else if (U.slice < nslices() - 1) U.slice++; break;
-    case K_UP: if (U.band > 0) U.band--; break;
-    case K_DOWN: if (U.band < (int)ST()->p[P_BANDS] - 1) U.band++; break;
+    case K_LEFT: if (U.page == PG_SEQ) cursor_set(cur() - 1); else if (U.slice > 0) U.slice--; break;
+    case K_RIGHT: if (U.page == PG_SEQ) cursor_set(cur() + 1); else if (U.slice < nslices() - 1) U.slice++; break;
+    case K_UP: case K_DOWN:
+        if (U.page == PG_SEQ) {   /* transpose the cursor step (Shift: an octave) */
+            xl_step *st = &ST()->st[cur()];
+            int d = (key == K_UP ? 1 : -1) * ((mods & MOD_SHIFT) ? 12 : 1), j;
+            if (step_on(st)) { undo_push(); for (j = 0; j < st->n; j++) { int v = st->note[j] + d; st->note[j] = (uint8_t)(v < 0 ? 0 : v > 127 ? 127 : v); } }
+        } else if (key == K_UP) { if (U.band > 0) U.band--; }
+        else if (U.band < (int)ST()->p[P_BANDS] - 1) U.band++;
+        break;
+    case K_DELETE: if (U.page == PG_SEQ) { xl_step *st = &ST()->st[cur()]; undo_push(); st->n = 0; st->time = ST_NOTE; st->flags = 0; cursor_set(cur() + 1); } break;
+    case '`': atomic_store(&XL.fill_held, 1); break;
     }
 }
 void xl_ui_drop(const char *path, float x, float y)
